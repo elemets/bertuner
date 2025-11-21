@@ -1,0 +1,7 @@
+models/*
+!models/.gitkeep
+mlruns/
+bertuner.egg-info/
+.deepeval/
+__pycache__/
+*.csv

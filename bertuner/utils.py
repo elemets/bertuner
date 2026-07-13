@@ -24,8 +24,15 @@ def split_group_stratified(df, group_col, y_col, seed=42, test_size=0.15, val_si
     n_splits2 = int(round(1 / test_frac_of_temp))
     n_splits2 = max(n_splits2, 2)
 
-    sgkf2 = StratifiedGroupKFold(n_splits=n_splits2, shuffle=True, random_state=seed + 1)
-    val_rel_idx, test_rel_idx = next(sgkf2.split(temp_df, temp_y, groups=temp_groups))
+    # StratifiedGroupKFold is heuristic and can produce a single-class fold;
+    # retry with a bumped seed until val and test both contain every class.
+    for attempt in range(10):
+        sgkf2 = StratifiedGroupKFold(
+            n_splits=n_splits2, shuffle=True, random_state=seed + 1 + attempt
+        )
+        val_rel_idx, test_rel_idx = next(sgkf2.split(temp_df, temp_y, groups=temp_groups))
+        if len(set(temp_y[val_rel_idx])) > 1 and len(set(temp_y[test_rel_idx])) > 1:
+            break
 
     val_idx = temp_df.index[val_rel_idx]
     test_idx = temp_df.index[test_rel_idx]

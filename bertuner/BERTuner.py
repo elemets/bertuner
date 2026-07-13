@@ -692,6 +692,7 @@ class BERTuneClassifier:
     def _save_model(self, path, trainer, tokenizer, model_path):
         """Saves model + tokenizer via save_pretrained and a JSON config for reloading."""
         save_dir = f"{path}/model"
+        os.makedirs(save_dir, exist_ok=True)
         trainer.save_model(save_dir)
         tokenizer.save_pretrained(save_dir)
 

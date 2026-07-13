@@ -14,8 +14,10 @@ class CleanupCheckpointsCallback(TrainerCallback):
 
 
 class TensorBoardSyncCallback(TrainerCallback):
-    def __init__(self, log_dir):
-        self.writer = SummaryWriter(log_dir)
+    def __init__(self, log_dir, writer_cls=None):
+        # Allow dependency injection for custom writers (e.g., testing or alternative loggers).
+        writer_cls = writer_cls or SummaryWriter
+        self.writer = writer_cls(log_dir)
         self.last_train_loss = None
 
     def on_log(self, args, state, control, logs=None, **kwargs):
@@ -35,4 +37,3 @@ class TensorBoardSyncCallback(TrainerCallback):
 
     def on_train_end(self, args, state, control, **kwargs):
         self.writer.close()
-

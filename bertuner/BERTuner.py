@@ -15,6 +15,7 @@ from transformers import (
     AutoConfig,
     AutoModelForSequenceClassification,
     TrainingArguments,
+    DataCollatorWithPadding,
     EarlyStoppingCallback,
     set_seed,
 )
@@ -35,7 +36,6 @@ from bertuner.TensorBoardCallback import (
     CleanupCheckpointsCallback,
 )
 from bertuner.utils import (
-    enhanced_balance_data,
     split_group_stratified,
     check_group_leakage,
 )
@@ -67,7 +67,6 @@ class BERTuneClassifier:
         dataframe: pd.DataFrame = None,
         num_labels: int = None,
         group_key: str = None,
-        balance_type: str = None,
         seed: int = SEED,
         mlflow_port: int = 9090,
         mlflow_tracking_uri: str = None,
@@ -84,10 +83,15 @@ class BERTuneClassifier:
         self.text_feature = text_feature
         self.target_cols = target_cols
         self.seed = seed
-        self.num_labels = num_labels or len(target_cols)
         self.df = pd.read_csv(data_path) if data_path is not None else dataframe.copy()
+        if num_labels is not None:
+            self.num_labels = num_labels
+        elif self.is_multilabel:
+            self.num_labels = len(target_cols)
+        else:
+            # Single-label: model head needs one logit per class, not per column
+            self.num_labels = int(self.df[target_cols[0]].nunique())
         self.group_key = group_key
-        self.balance_type = balance_type
         if mlflow_tracking_uri is not None:
             # File-based tracking: logs to a local directory, no server required.
             # Accepts a plain path (converted to file: URI) or any mlflow URI.
@@ -231,7 +235,7 @@ class BERTuneClassifier:
     # Data preparation
     # ------------------------------------------------------------------
 
-    def _prepare_datasets(self, tokenizer, group_key, balance_type, max_length=512):
+    def _prepare_datasets(self, tokenizer, group_key, max_length=512):
         """
         Splits, balances, and tokenizes data.
 
@@ -278,11 +282,11 @@ class BERTuneClassifier:
         def _tokenize(data):
             data = data.copy()
             ds = Dataset.from_pandas(data)
+            # No padding here — DataCollatorWithPadding pads each batch dynamically
             ds = ds.map(
                 lambda x: tokenizer(
                     x[self.text_feature],
                     truncation=True,
-                    padding="max_length",
                     max_length=max_length,
                 ),
                 batched=True,
@@ -410,7 +414,7 @@ class BERTuneClassifier:
 
         tokenizer = self._get_tokenizer(model_path)
         self.train_ds, self.val_ds, self.test_ds = self._prepare_datasets(
-            tokenizer, self.group_key, self.balance_type, self.max_length
+            tokenizer, self.group_key, self.max_length
         )
 
         class_weights = self._compute_class_weights(self.train_ds)
@@ -445,6 +449,7 @@ class BERTuneClassifier:
             args=args,
             train_dataset=self.train_ds,
             eval_dataset=self.val_ds,
+            data_collator=DataCollatorWithPadding(tokenizer),
             compute_metrics=self._compute_metrics,
             callbacks=[
                 EarlyStoppingCallback(early_stopping_patience=params["early_stopping_patience"])
@@ -454,7 +459,7 @@ class BERTuneClassifier:
         )
 
         if self.log_level == "verbose":
-            with mlflow.start_run(run_name=f"trial_{trial.number}", nested=True):
+            with mlflow.start_run(run_name=f"trial_{trial.number}"):
                 mlflow.log_params(params)
                 trainer.train()
                 metrics = trainer.evaluate()
@@ -475,7 +480,7 @@ class BERTuneClassifier:
         n_trials: int = 10,
         optimize_metric: str = "avg_precision",
         study_name: str = "bert_optimization",
-        greater_is_better: bool = False,
+        greater_is_better: bool = True,
     ):
 
         self.greater_is_better = greater_is_better
@@ -515,7 +520,7 @@ class BERTuneClassifier:
 
         tokenizer = self._get_tokenizer(model_path)
         train_ds, val_ds, test_ds = self._prepare_datasets(
-            tokenizer, self.group_key, self.balance_type, self.max_length
+            tokenizer, self.group_key, self.max_length
         )
 
         class_weights = self._compute_class_weights(train_ds)
@@ -542,12 +547,13 @@ class BERTuneClassifier:
             seed=self.seed,
         )
 
-        with mlflow.start_run(run_name=run_name, nested=True):
+        with mlflow.start_run(run_name=run_name):
             trainer = CustomTrainer(
                 model=model,
                 args=args,
                 train_dataset=train_ds,
                 eval_dataset=val_ds,
+                data_collator=DataCollatorWithPadding(tokenizer),
                 compute_metrics=self._compute_metrics,
                 callbacks=[
                     EarlyStoppingCallback(
@@ -578,7 +584,7 @@ class BERTuneClassifier:
                 for m in ["Accuracy", "F1", "AUC"]:
                     mlflow.log_metric(f"{row['Split']}_{m}", row[m])
 
-            self._save_config(final_dir, model)
+            self._save_model(final_dir, trainer, tokenizer, model_path)
 
         return metrics_df, model, test_ds
 
@@ -683,10 +689,11 @@ class BERTuneClassifier:
     # Persistence
     # ------------------------------------------------------------------
 
-    def _save_config(self, path, model):
-        """Saves model state and JSON config."""
-        save_path = f"{path}/final_optimized_model.pth"
-        torch.save(model.state_dict(), save_path)
+    def _save_model(self, path, trainer, tokenizer, model_path):
+        """Saves model + tokenizer via save_pretrained and a JSON config for reloading."""
+        save_dir = f"{path}/model"
+        trainer.save_model(save_dir)
+        tokenizer.save_pretrained(save_dir)
 
         threshold = self.best_threshold
         # Convert numpy array to list for JSON serialisation
@@ -696,13 +703,15 @@ class BERTuneClassifier:
         config = {
             "model_metadata": {
                 "model": self.best_params["model"],
+                "model_path": model_path,
                 "optimal_threshold": threshold,
                 "is_multilabel": self.is_multilabel,
                 "target_cols": self.target_cols,
+                "max_length": self.max_length,
             },
             "parameters": self.best_params,
         }
-        with open(save_path.replace(".pth", "_config.json"), "w") as f:
+        with open(f"{save_dir}/bertuner_config.json", "w") as f:
             json.dump(config, f, indent=2)
 
     def _cleanup_trials(self, keep_trial_id):

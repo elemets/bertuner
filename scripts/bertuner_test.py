@@ -6,6 +6,7 @@ classifier_opt = BERTuneClassifier(
     models_dir="./models/BERTModels",
     text_feature="text_feature",
     target_cols=["target"],
+    mlflow_tracking_uri="./mlruns"
 )
 ## initializing model choices with default options
 classifier_opt.initialize_model_choices()

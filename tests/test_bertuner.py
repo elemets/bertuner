@@ -9,7 +9,10 @@ import pytest
 import optuna
 
 from bertuner.BERTuner import BERTuneClassifier
-from bertuner.constants import DEFAULT_SEARCH_SPACE_SINGLELABEL
+from bertuner.constants import (
+    DEFAULT_SEARCH_SPACE_LONGCONTEXT,
+    DEFAULT_SEARCH_SPACE_SINGLELABEL,
+)
 
 
 def make_df(n=40, num_classes=2, multilabel_cols=None, seed=0):
@@ -306,3 +309,107 @@ class TestSaveModel:
         with open(tmp_path / "model" / "bertuner_config.json") as f:
             config = json.load(f)
         assert config["model_metadata"]["optimal_threshold"] == [0.3, 0.6]
+
+    def test_explicit_max_length_overrides_requested(self, tmp_path):
+        clf = make_classifier(tmp_path, max_length=8192)
+        clf.best_params = {"model": "bert-base"}
+        clf.best_threshold = 0.5
+
+        clf._save_model(str(tmp_path), MagicMock(), MagicMock(), "bert-base-uncased", 512)
+
+        with open(tmp_path / "model" / "bertuner_config.json") as f:
+            config = json.load(f)
+        assert config["model_metadata"]["max_length"] == 512
+
+
+# ------------------------------------------------------------------
+# Long-context support
+# ------------------------------------------------------------------
+
+
+class TestLongContext:
+    def test_max_length_clamped_to_model_capacity(self, tmp_path):
+        clf = make_classifier(tmp_path, max_length=8192)
+        tok = SimpleNamespace(model_max_length=512)
+        assert clf._effective_max_length(tok, "bert-base-uncased") == 512
+
+    def test_requested_max_length_kept_when_model_allows(self, tmp_path):
+        clf = make_classifier(tmp_path, max_length=4096)
+        tok = SimpleNamespace(model_max_length=8192)
+        assert clf._effective_max_length(tok, "answerdotai/ModernBERT-base") == 4096
+
+    def test_gradient_checkpointing_auto_by_length(self, tmp_path):
+        clf = make_classifier(tmp_path)
+        assert clf._use_gradient_checkpointing(8192) is True
+        assert clf._use_gradient_checkpointing(512) is False
+
+    def test_gradient_checkpointing_explicit_override(self, tmp_path):
+        clf = make_classifier(tmp_path, gradient_checkpointing=False)
+        assert clf._use_gradient_checkpointing(8192) is False
+
+    def test_longcontext_search_space_round_trip(self, tmp_path):
+        clf = make_classifier(tmp_path)
+        clf.search_space = DEFAULT_SEARCH_SPACE_LONGCONTEXT
+        fixed = {
+            "model": "modernbert-large",
+            "learning_rate": 1e-5,
+            "batch_size": 2,
+            "gradient_accumulation_steps": 8,
+            "loss_type": "weighted",
+            "label_smoothing": 0.05,
+            "focal_gamma": 2.0,
+            "weight_decay": 0.1,
+            "warmup_ratio": 0.1,
+            "scheduler": "linear",
+            "dropout": 0.1,
+            "early_stopping_patience": 4,
+        }
+        params = clf._suggest_hyperparams(optuna.trial.FixedTrial(fixed))
+        assert params == fixed
+
+    def test_modernbert_dropout_attrs_applied(self, tmp_path, monkeypatch):
+        clf = make_classifier(tmp_path)
+        cfg = SimpleNamespace(
+            model_type="modernbert",
+            attention_dropout=0.0,
+            mlp_dropout=0.0,
+            classifier_dropout=0.0,
+            embedding_dropout=0.0,
+        )
+        monkeypatch.setattr(
+            "bertuner.BERTuner.AutoConfig",
+            SimpleNamespace(from_pretrained=lambda *a, **k: cfg),
+        )
+        monkeypatch.setattr(
+            "bertuner.BERTuner.AutoModelForSequenceClassification",
+            SimpleNamespace(from_pretrained=MagicMock()),
+        )
+        clf._load_model("answerdotai/ModernBERT-large", 0.2)
+        assert (
+            cfg.attention_dropout
+            == cfg.mlp_dropout
+            == cfg.classifier_dropout
+            == cfg.embedding_dropout
+            == 0.2
+        )
+
+    def test_bert_style_dropout_attrs_applied(self, tmp_path, monkeypatch):
+        clf = make_classifier(tmp_path)
+        cfg = SimpleNamespace(
+            model_type="bert",
+            hidden_dropout_prob=0.1,
+            attention_probs_dropout_prob=0.1,
+            classifier_dropout=None,
+        )
+        monkeypatch.setattr(
+            "bertuner.BERTuner.AutoConfig",
+            SimpleNamespace(from_pretrained=lambda *a, **k: cfg),
+        )
+        monkeypatch.setattr(
+            "bertuner.BERTuner.AutoModelForSequenceClassification",
+            SimpleNamespace(from_pretrained=MagicMock()),
+        )
+        clf._load_model("bert-base-uncased", 0.25)
+        assert cfg.hidden_dropout_prob == 0.25
+        assert cfg.attention_probs_dropout_prob == 0.25
+        assert cfg.classifier_dropout == 0.25

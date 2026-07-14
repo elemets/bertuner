@@ -6,6 +6,25 @@ DEFAULT_MODEL_CHOICES = {
     "bert-base": "bert-base-uncased",
     "electra-small": "google/electra-small-discriminator",
     "electra-base": "google/electra-base-discriminator",
+    "modernbert-base": "answerdotai/ModernBERT-base",
+    "modernbert-large": "answerdotai/ModernBERT-large",
+}
+
+# Dropout attribute names per architecture (config.model_type).
+# "default" covers BERT/RoBERTa/ELECTRA-style configs.
+MODEL_DROPOUT_ATTRS = {
+    "distilbert": ("dropout", "attention_dropout", "seq_classif_dropout"),
+    "modernbert": (
+        "attention_dropout",
+        "mlp_dropout",
+        "classifier_dropout",
+        "embedding_dropout",
+    ),
+    "default": (
+        "hidden_dropout_prob",
+        "attention_probs_dropout_prob",
+        "classifier_dropout",
+    ),
 }
 
 DEFAULT_SEARCH_SPACE_SINGLELABEL = {
@@ -31,6 +50,15 @@ DEFAULT_SEARCH_SPACE_MULTILABEL = {
     "scheduler": ["linear", "cosine"],
     "dropout": {"low": 0.0, "high": 0.3},
     "early_stopping_patience": {"low": 3, "high": 8},
+}
+
+# Long-context models (e.g. ModernBERT, 8192 tokens): tiny per-device batches with
+# gradient accumulation so the effective batch size stays in the usual 8-32 range.
+DEFAULT_SEARCH_SPACE_LONGCONTEXT = {
+    **DEFAULT_SEARCH_SPACE_SINGLELABEL,
+    "model": ["modernbert-base", "modernbert-large"],
+    "batch_size": [1, 2, 4],
+    "gradient_accumulation_steps": [4, 8, 16],
 }
 
 DEFAULT_SEARCH_SPACE = DEFAULT_SEARCH_SPACE_SINGLELABEL  # backwards-compatible default

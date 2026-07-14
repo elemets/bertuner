@@ -44,6 +44,7 @@ from bertuner.constants import (
     DEFAULT_SEARCH_SPACE,
     DEFAULT_SEARCH_SPACE_SINGLELABEL,
     DEFAULT_SEARCH_SPACE_MULTILABEL,
+    MODEL_DROPOUT_ATTRS,
     SEED,
 )
 
@@ -72,6 +73,7 @@ class BERTuneClassifier:
         mlflow_tracking_uri: str = None,
         log_level: str = "best",
         max_length: int = 512,
+        gradient_checkpointing: bool = None,
     ):
         if data_path is None and dataframe is None:
             raise ValueError("Provide either data_path (CSV) or dataframe, not neither.")
@@ -105,6 +107,9 @@ class BERTuneClassifier:
         # Single-label: scalar float. Multi-label: array of per-label floats.
         self.best_threshold = 0.5
         self.max_length = max_length
+        # None → auto: enabled when the effective sequence length is long enough
+        # that activation memory dominates (see _use_gradient_checkpointing).
+        self.gradient_checkpointing = gradient_checkpointing
         self._setup_seed()
         if self.mlflow_uri.startswith("http"):
             print(f"Please make sure an mlflow instance is running on: {self.mlflow_uri}")
@@ -162,6 +167,34 @@ class BERTuneClassifier:
         """Get tokenizer. DeBERTa fast tokenizer has compatibility issues."""
         use_fast = "deberta" not in model_path.lower()
         return AutoTokenizer.from_pretrained(model_path, use_fast=use_fast)
+
+    def _effective_max_length(self, tokenizer, model_path: str) -> int:
+        """Clamps the requested max_length to what the model can actually encode."""
+        capacity = getattr(tokenizer, "model_max_length", None)
+        # Some tokenizers report a huge sentinel instead of the real limit
+        if capacity is None or capacity > 100_000:
+            capacity = getattr(
+                AutoConfig.from_pretrained(model_path),
+                "max_position_embeddings",
+                self.max_length,
+            )
+        if self.max_length > capacity:
+            print(
+                f"[WARNING] max_length={self.max_length} exceeds the context window "
+                f"of {model_path} ({capacity}); using {capacity} for this model."
+            )
+        return min(self.max_length, capacity)
+
+    def _precision_flags(self) -> dict:
+        """bf16 where the GPU supports it (required for ModernBERT), else fp16."""
+        bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
+        return {"bf16": bf16, "fp16": torch.cuda.is_available() and not bf16}
+
+    def _use_gradient_checkpointing(self, max_length: int) -> bool:
+        """Auto-enables checkpointing for long sequences unless explicitly overridden."""
+        if self.gradient_checkpointing is not None:
+            return self.gradient_checkpointing
+        return max_length > 1024
 
     # ------------------------------------------------------------------
     # Metrics
@@ -379,28 +412,12 @@ class BERTuneClassifier:
         )
 
         drop = float(dropout)
-        if config.model_type == "distilbert":
-            config.dropout = drop
-            config.attention_dropout = drop
-            if hasattr(config, "seq_classif_dropout"):
-                config.seq_classif_dropout = drop
-        else:
-            if hasattr(config, "hidden_dropout_prob"):
-                config.hidden_dropout_prob = drop
-            if hasattr(config, "attention_probs_dropout_prob"):
-                config.attention_probs_dropout_prob = drop
+        attrs = MODEL_DROPOUT_ATTRS.get(config.model_type, MODEL_DROPOUT_ATTRS["default"])
+        for attr in attrs:
+            if hasattr(config, attr):
+                setattr(config, attr, drop)
 
-        # Try passing dropout kwargs first (works for BERT/RoBERTa without config override)
-        try:
-            model = AutoModelForSequenceClassification.from_pretrained(
-                model_path,
-                config=config,
-                hidden_dropout_prob=drop,
-                attention_probs_dropout_prob=drop,
-            )
-        except TypeError:
-            model = AutoModelForSequenceClassification.from_pretrained(model_path, config=config)
-        return model
+        return AutoModelForSequenceClassification.from_pretrained(model_path, config=config)
 
     # ------------------------------------------------------------------
     # Optuna objective
@@ -413,8 +430,9 @@ class BERTuneClassifier:
         self._setup_seed()
 
         tokenizer = self._get_tokenizer(model_path)
+        max_length = self._effective_max_length(tokenizer, model_path)
         self.train_ds, self.val_ds, self.test_ds = self._prepare_datasets(
-            tokenizer, self.group_key, self.max_length
+            tokenizer, self.group_key, max_length
         )
 
         class_weights = self._compute_class_weights(self.train_ds)
@@ -428,6 +446,9 @@ class BERTuneClassifier:
             learning_rate=params["learning_rate"],
             per_device_train_batch_size=params["batch_size"],
             per_device_eval_batch_size=params["batch_size"],
+            gradient_accumulation_steps=params.get("gradient_accumulation_steps", 1),
+            gradient_checkpointing=self._use_gradient_checkpointing(max_length),
+            gradient_checkpointing_kwargs={"use_reentrant": False},
             weight_decay=params["weight_decay"],
             warmup_ratio=params["warmup_ratio"],
             metric_for_best_model=optimize_metric_key,
@@ -438,10 +459,10 @@ class BERTuneClassifier:
             num_train_epochs=6,
             save_total_limit=2,
             load_best_model_at_end=True,
-            fp16=torch.cuda.is_available(),
             seed=self.seed,
             remove_unused_columns=True,
             report_to=["none"],
+            **self._precision_flags(),
         )
 
         trainer = CustomTrainer(
@@ -519,8 +540,9 @@ class BERTuneClassifier:
         model_path = self.MODEL_CHOICES[self.best_params["model"]]
 
         tokenizer = self._get_tokenizer(model_path)
+        max_length = self._effective_max_length(tokenizer, model_path)
         train_ds, val_ds, test_ds = self._prepare_datasets(
-            tokenizer, self.group_key, self.max_length
+            tokenizer, self.group_key, max_length
         )
 
         class_weights = self._compute_class_weights(train_ds)
@@ -535,16 +557,19 @@ class BERTuneClassifier:
             learning_rate=self.best_params["learning_rate"],
             per_device_train_batch_size=self.best_params["batch_size"],
             per_device_eval_batch_size=self.best_params["batch_size"],
+            gradient_accumulation_steps=self.best_params.get("gradient_accumulation_steps", 1),
+            gradient_checkpointing=self._use_gradient_checkpointing(max_length),
+            gradient_checkpointing_kwargs={"use_reentrant": False},
             weight_decay=self.best_params["weight_decay"],
             warmup_ratio=self.best_params["warmup_ratio"],
             metric_for_best_model=f"eval_{self.optimize_metric}",
             greater_is_better=self.greater_is_better,
             save_total_limit=2,
             load_best_model_at_end=True,
-            fp16=torch.cuda.is_available(),
             report_to=["tensorboard", "mlflow"],
             logging_dir=f"{final_dir}/logs",
             seed=self.seed,
+            **self._precision_flags(),
         )
 
         with mlflow.start_run(run_name=run_name):
@@ -584,7 +609,7 @@ class BERTuneClassifier:
                 for m in ["Accuracy", "F1", "AUC"]:
                     mlflow.log_metric(f"{row['Split']}_{m}", row[m])
 
-            self._save_model(final_dir, trainer, tokenizer, model_path)
+            self._save_model(final_dir, trainer, tokenizer, model_path, max_length)
 
         return metrics_df, model, test_ds
 
@@ -689,7 +714,7 @@ class BERTuneClassifier:
     # Persistence
     # ------------------------------------------------------------------
 
-    def _save_model(self, path, trainer, tokenizer, model_path):
+    def _save_model(self, path, trainer, tokenizer, model_path, max_length=None):
         """Saves model + tokenizer via save_pretrained and a JSON config for reloading."""
         save_dir = f"{path}/model"
         os.makedirs(save_dir, exist_ok=True)
@@ -708,7 +733,7 @@ class BERTuneClassifier:
                 "optimal_threshold": threshold,
                 "is_multilabel": self.is_multilabel,
                 "target_cols": self.target_cols,
-                "max_length": self.max_length,
+                "max_length": max_length if max_length is not None else self.max_length,
             },
             "parameters": self.best_params,
         }

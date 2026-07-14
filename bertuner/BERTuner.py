@@ -87,10 +87,6 @@ class BERTuneClassifier:
         self.target_cols = target_cols
         self.seed = seed
         self.df = pd.read_csv(data_path) if data_path is not None else dataframe.copy()
-        self.label2id = None
-        self.id2label = None
-        if not self.is_multilabel:
-            self._encode_labels()
         if num_labels is not None:
             self.num_labels = num_labels
         elif self.is_multilabel:
@@ -160,21 +156,6 @@ class BERTuneClassifier:
         else:
             self.search_space = DEFAULT_SEARCH_SPACE_SINGLELABEL
         print(f"Search space set ({'multi-label' if self.is_multilabel else 'single-label'} mode)")
-
-    def _encode_labels(self):
-        """
-        Maps single-label targets to contiguous ids 0..n-1 (handles string labels
-        and non-contiguous ints). Keeps id2label/label2id for the saved model.
-        No-op when labels are already 0..n-1 integers.
-        """
-        col = self.target_cols[0]
-        classes = sorted(self.df[col].dropna().unique().tolist())
-        if classes == list(range(len(classes))):
-            return
-        self.label2id = {c: i for i, c in enumerate(classes)}
-        self.id2label = {i: str(c) for i, c in enumerate(classes)}
-        self.df[col] = self.df[col].map(self.label2id)
-        print(f"Encoded target labels: {self.label2id}")
 
     def _setup_seed(self):
         """Sets reproducible seeds."""
@@ -403,7 +384,8 @@ class BERTuneClassifier:
 
     def _compute_class_weights(self, train_ds) -> torch.Tensor:
         """
-        Single-label : returns shape (2,)  — weight for [neg, pos] class.
+        Binary       : returns shape (2,)  — weight for [neg, pos] class.
+        Multiclass   : returns shape (num_labels,) — balanced inverse-frequency weights.
         Multi-label  : returns shape (num_labels,) — pos_weight per label,
                        suitable for BCEWithLogitsLoss(pos_weight=...).
         """
@@ -414,12 +396,17 @@ class BERTuneClassifier:
             neg_counts = (len(all_labels) - all_labels.sum(axis=0)).clip(min=1)
             pos_weight = neg_counts / pos_counts  # shape (num_labels,)
             return torch.tensor(pos_weight, dtype=torch.float)
-        else:
+        elif self.is_binary:
             labels = [item["labels"].item() for item in train_ds]
             neg = labels.count(0)
             pos = labels.count(1)
             pos = max(pos, 1)
             return torch.tensor([1.0, neg / pos], dtype=torch.float)
+        else:
+            labels = [item["labels"].item() for item in train_ds]
+            counts = np.bincount(labels, minlength=self.num_labels).clip(min=1)
+            weights = len(labels) / (self.num_labels * counts)
+            return torch.tensor(weights, dtype=torch.float)
 
     # ------------------------------------------------------------------
     # Hyperparameter suggestion
@@ -451,15 +438,10 @@ class BERTuneClassifier:
         problem_type = (
             "multi_label_classification" if self.is_multilabel else "single_label_classification"
         )
-        label_kwargs = {}
-        if self.id2label:
-            label_kwargs["id2label"] = self.id2label
-            label_kwargs["label2id"] = {str(k): v for k, v in self.label2id.items()}
         config = AutoConfig.from_pretrained(
             model_path,
             num_labels=self.num_labels,
             problem_type=problem_type,
-            **label_kwargs,
         )
 
         drop = float(dropout)
@@ -820,7 +802,6 @@ class BERTuneClassifier:
                 "is_multilabel": self.is_multilabel,
                 "target_cols": self.target_cols,
                 "max_length": max_length if max_length is not None else self.max_length,
-                "id2label": self.id2label,
             },
             "parameters": self.best_params,
         }

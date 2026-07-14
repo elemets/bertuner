@@ -10,7 +10,7 @@ from bertuner.Predictor import BERTunePredictor
 MODEL_PATH = "google/electra-small-discriminator"
 
 
-def _save_model_dir(tmp_dir, num_labels, is_multilabel, threshold, target_cols, id2label=None):
+def _save_model_dir(tmp_dir, num_labels, is_multilabel, threshold, target_cols):
     try:
         tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH, local_files_only=True)
         model = AutoModelForSequenceClassification.from_pretrained(
@@ -36,7 +36,6 @@ def _save_model_dir(tmp_dir, num_labels, is_multilabel, threshold, target_cols, 
             "is_multilabel": is_multilabel,
             "target_cols": target_cols,
             "max_length": 128,
-            "id2label": id2label,
         },
         "parameters": {"model": "electra-small"},
     }
@@ -60,9 +59,7 @@ def multilabel_model_dir(tmp_path_factory):
 @pytest.fixture(scope="module")
 def multiclass_model_dir(tmp_path_factory):
     d = tmp_path_factory.mktemp("multiclass_model")
-    return _save_model_dir(
-        d, 3, False, None, ["target"], id2label={"0": "low", "1": "mid", "2": "high"}
-    )
+    return _save_model_dir(d, 3, False, None, ["target"])
 
 
 class TestBinaryPredictor:
@@ -129,10 +126,9 @@ class TestMultilabelPredictor:
 
 
 class TestMulticlassPredictor:
-    def test_loads_none_threshold_and_id2label(self, multiclass_model_dir):
+    def test_loads_none_threshold(self, multiclass_model_dir):
         p = BERTunePredictor(multiclass_model_dir, device="cpu")
         assert p.threshold is None
-        assert p.id2label == {0: "low", 1: "mid", 2: "high"}
 
     def test_predict_is_argmax(self, multiclass_model_dir):
         p = BERTunePredictor(multiclass_model_dir, device="cpu")
@@ -140,8 +136,8 @@ class TestMulticlassPredictor:
         probs = p.predict_proba(texts)
         np.testing.assert_array_equal(p.predict(texts), probs.argmax(axis=1))
 
-    def test_predict_df_maps_ids_to_labels(self, multiclass_model_dir):
+    def test_predict_df_returns_class_ids(self, multiclass_model_dir):
         p = BERTunePredictor(multiclass_model_dir, device="cpu")
         df = p.predict_df(["hello", "world"])
         assert list(df.columns) == ["target"]
-        assert set(df["target"]) <= {"low", "mid", "high"}
+        assert set(df["target"]) <= {0, 1, 2}

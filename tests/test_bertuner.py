@@ -416,52 +416,6 @@ class TestLongContext:
 
 
 # ------------------------------------------------------------------
-# Label encoding
-# ------------------------------------------------------------------
-
-
-class TestLabelEncoding:
-    def test_contiguous_int_labels_untouched(self, tmp_path):
-        clf = make_classifier(tmp_path)
-        assert clf.label2id is None
-        assert clf.id2label is None
-
-    def test_string_labels_encoded(self, tmp_path):
-        df = make_df()
-        df["target"] = np.where(df["target"] == 1, "spam", "ham")
-        clf = make_classifier(tmp_path, dataframe=df)
-        assert clf.label2id == {"ham": 0, "spam": 1}
-        assert clf.id2label == {0: "ham", 1: "spam"}
-        assert sorted(clf.df["target"].unique()) == [0, 1]
-        assert clf.num_labels == 2
-
-    def test_noncontiguous_int_labels_remapped(self, tmp_path):
-        df = make_df()
-        df["target"] = df["target"] + 1  # labels 1, 2
-        clf = make_classifier(tmp_path, dataframe=df)
-        assert clf.label2id == {1: 0, 2: 1}
-        assert sorted(clf.df["target"].unique()) == [0, 1]
-
-    def test_multilabel_skips_encoding(self, tmp_path):
-        cols = ["l1", "l2"]
-        clf = make_classifier(
-            tmp_path, target_cols=cols, dataframe=make_df(multilabel_cols=cols)
-        )
-        assert clf.label2id is None
-
-    def test_id2label_saved_in_config(self, tmp_path):
-        df = make_df()
-        df["target"] = np.where(df["target"] == 1, "yes", "no")
-        clf = make_classifier(tmp_path, dataframe=df)
-        clf.best_params = {"model": "bert-base"}
-        clf.best_threshold = 0.5
-        clf._save_model(str(tmp_path), MagicMock(), MagicMock(), "bert-base-uncased")
-        with open(tmp_path / "model" / "bertuner_config.json") as f:
-            config = json.load(f)
-        assert config["model_metadata"]["id2label"] == {"0": "no", "1": "yes"}
-
-
-# ------------------------------------------------------------------
 # Multiclass (3+ classes, single-label)
 # ------------------------------------------------------------------
 
@@ -506,6 +460,15 @@ class TestMulticlass:
         labels = np.array([0, 1])  # class 2 absent from eval split
         metrics = clf._compute_metrics((logits, labels))
         assert metrics["auc_roc"] == 0.5
+
+    def test_class_weights_one_per_class(self, tmp_path):
+        import torch
+
+        clf = self.make_multiclass(tmp_path)
+        ds = [{"labels": torch.tensor(i % 3)} for i in range(12)]
+        w = clf._compute_class_weights(ds)
+        assert w.shape == (3,)
+        assert w[0] == pytest.approx(1.0)  # balanced classes → uniform weights
 
     def test_build_metrics_df_argmax(self, tmp_path):
         clf = self.make_multiclass(tmp_path)

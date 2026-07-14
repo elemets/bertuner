@@ -5,3 +5,5 @@ bertuner.egg-info/
 .deepeval/
 __pycache__/
 *.csv
+dist/
+build/

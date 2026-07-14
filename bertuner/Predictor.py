@@ -30,9 +30,6 @@ class BERTunePredictor:
         threshold = meta["optimal_threshold"]
         self.threshold = np.array(threshold) if isinstance(threshold, list) else threshold
 
-        id2label = meta.get("id2label")
-        self.id2label = {int(k): v for k, v in id2label.items()} if id2label else None
-
         self.batch_size = batch_size
         self.device = torch.device(
             device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -86,14 +83,8 @@ class BERTunePredictor:
         return probs.argmax(axis=1)
 
     def predict_df(self, texts: str | list[str]) -> pd.DataFrame:
-        """Predictions as a DataFrame with one column per target.
-
-        Single-label predictions are mapped back to the original label values
-        (e.g. strings) when the model was trained on encoded labels.
-        """
+        """Predictions as a DataFrame with one column per target."""
         preds = self.predict(texts)
         if self.is_multilabel:
             return pd.DataFrame(preds, columns=self.target_cols)
-        if self.id2label:
-            preds = [self.id2label[int(i)] for i in preds]
         return pd.DataFrame({self.target_cols[0]: preds})

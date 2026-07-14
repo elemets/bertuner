@@ -4,9 +4,17 @@ A library for hyperparameter optimization and fine-tuning of BERT-based classifi
 
 Supports both classic 512-token encoders (BERT, RoBERTa, DistilBERT, ELECTRA) and long-context models such as **ModernBERT** (8192 tokens). Per-architecture dropout is applied automatically, `max_length` is clamped to each model's real context window, precision is bf16 where the GPU supports it, and gradient checkpointing switches on automatically for sequences longer than 1024 tokens (override with `gradient_checkpointing=True/False`).
 
-## Setup
+## Installation
 
 ```bash
+pip install bertuner[train]     # training + inference
+pip install bertuner            # inference only (BERTunePredictor)
+```
+
+From source (development):
+
+```bash
+git clone https://github.com/elemets/bertuner && cd bertuner
 pip install -r requirements.txt
 ```
 

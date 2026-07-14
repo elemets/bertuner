@@ -1,6 +1,42 @@
-import pandas as pd 
+import pandas as pd
 
-from sklearn.model_selection import StratifiedGroupKFold
+from sklearn.model_selection import StratifiedGroupKFold, train_test_split
+
+
+def train_val_test_split(
+    X,
+    y,
+    train_size=0.7,
+    validation_size=0.15,
+    test_size=0.15,
+    random_state=42,
+    stratify_y=True,
+):
+    """Two-stage stratified train/val/test split.
+
+    Returns X_train, X_val, X_test, y_train, y_val, y_test in the same
+    order as the model_tuner function this replaces.
+    """
+    total = train_size + validation_size + test_size
+    if abs(total - 1.0) > 1e-6:
+        raise ValueError(f"train/validation/test sizes must sum to 1, got {total}")
+
+    holdout = validation_size + test_size
+    X_train, X_tmp, y_train, y_tmp = train_test_split(
+        X,
+        y,
+        test_size=holdout,
+        random_state=random_state,
+        stratify=y if stratify_y else None,
+    )
+    X_val, X_test, y_val, y_test = train_test_split(
+        X_tmp,
+        y_tmp,
+        test_size=test_size / holdout,
+        random_state=random_state,
+        stratify=y_tmp if stratify_y else None,
+    )
+    return X_train, X_val, X_test, y_train, y_val, y_test
 
 
 def split_group_stratified(df, group_col, y_col, seed=42, test_size=0.15, val_size=0.15):

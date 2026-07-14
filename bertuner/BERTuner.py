@@ -27,9 +27,9 @@ from sklearn.metrics import (
     roc_auc_score,
     accuracy_score,
 )
+from sklearn.preprocessing import label_binarize
 from mlflow.tracking import MlflowClient
 
-from model_tuner import train_val_test_split
 from bertuner.CustomTrainer import CustomTrainer
 from bertuner.TensorBoardCallback import (
     TensorBoardSyncCallback,
@@ -38,6 +38,7 @@ from bertuner.TensorBoardCallback import (
 from bertuner.utils import (
     split_group_stratified,
     check_group_leakage,
+    train_val_test_split,
 )
 from bertuner.constants import (
     DEFAULT_MODEL_CHOICES,
@@ -86,6 +87,10 @@ class BERTuneClassifier:
         self.target_cols = target_cols
         self.seed = seed
         self.df = pd.read_csv(data_path) if data_path is not None else dataframe.copy()
+        self.label2id = None
+        self.id2label = None
+        if not self.is_multilabel:
+            self._encode_labels()
         if num_labels is not None:
             self.num_labels = num_labels
         elif self.is_multilabel:
@@ -132,6 +137,11 @@ class BERTuneClassifier:
         """True when there are multiple target columns (multi-label classification)."""
         return len(self.target_cols) > 1
 
+    @property
+    def is_binary(self) -> bool:
+        """True for single-label two-class classification (thresholded predictions)."""
+        return not self.is_multilabel and self.num_labels == 2
+
     # ------------------------------------------------------------------
     # Setup helpers
     # ------------------------------------------------------------------
@@ -150,6 +160,21 @@ class BERTuneClassifier:
         else:
             self.search_space = DEFAULT_SEARCH_SPACE_SINGLELABEL
         print(f"Search space set ({'multi-label' if self.is_multilabel else 'single-label'} mode)")
+
+    def _encode_labels(self):
+        """
+        Maps single-label targets to contiguous ids 0..n-1 (handles string labels
+        and non-contiguous ints). Keeps id2label/label2id for the saved model.
+        No-op when labels are already 0..n-1 integers.
+        """
+        col = self.target_cols[0]
+        classes = sorted(self.df[col].dropna().unique().tolist())
+        if classes == list(range(len(classes))):
+            return
+        self.label2id = {c: i for i, c in enumerate(classes)}
+        self.id2label = {i: str(c) for i, c in enumerate(classes)}
+        self.df[col] = self.df[col].map(self.label2id)
+        print(f"Encoded target labels: {self.label2id}")
 
     def _setup_seed(self):
         """Sets reproducible seeds."""
@@ -249,18 +274,39 @@ class BERTuneClassifier:
                 preds = predictions
                 probs = None
 
-            metrics = {
-                "accuracy": accuracy_score(labels, preds),
-                "precision": precision_score(labels, preds, zero_division=0),
-                "recall": recall_score(labels, preds, zero_division=0),
-                "f1": f1_score(labels, preds, zero_division=0),
-                "specificity": recall_score(labels, preds, pos_label=0, zero_division=0),
-            }
-            if probs is not None:
-                metrics["avg_precision"] = average_precision_score(labels, probs[:, 1])
-                metrics["auc_roc"] = (
-                    roc_auc_score(labels, probs[:, 1]) if len(np.unique(labels)) > 1 else 0.5
-                )
+            if self.is_binary:
+                metrics = {
+                    "accuracy": accuracy_score(labels, preds),
+                    "precision": precision_score(labels, preds, zero_division=0),
+                    "recall": recall_score(labels, preds, zero_division=0),
+                    "f1": f1_score(labels, preds, zero_division=0),
+                    "specificity": recall_score(labels, preds, pos_label=0, zero_division=0),
+                }
+                if probs is not None:
+                    metrics["avg_precision"] = average_precision_score(labels, probs[:, 1])
+                    metrics["auc_roc"] = (
+                        roc_auc_score(labels, probs[:, 1]) if len(np.unique(labels)) > 1 else 0.5
+                    )
+            else:
+                # Multiclass: macro-averaged metrics, one-vs-rest ranking metrics
+                metrics = {
+                    "accuracy": accuracy_score(labels, preds),
+                    "precision": precision_score(labels, preds, average="macro", zero_division=0),
+                    "recall": recall_score(labels, preds, average="macro", zero_division=0),
+                    "f1": f1_score(labels, preds, average="macro", zero_division=0),
+                }
+                # Ranking metrics need every class present in the eval split
+                if probs is not None and len(np.unique(labels)) == probs.shape[1]:
+                    y_bin = label_binarize(labels, classes=np.arange(probs.shape[1]))
+                    metrics["avg_precision"] = average_precision_score(
+                        y_bin, probs, average="macro"
+                    )
+                    metrics["auc_roc"] = roc_auc_score(
+                        labels, probs, multi_class="ovr", average="macro"
+                    )
+                elif probs is not None:
+                    metrics["avg_precision"] = 0.5
+                    metrics["auc_roc"] = 0.5
 
         return metrics
 
@@ -405,10 +451,15 @@ class BERTuneClassifier:
         problem_type = (
             "multi_label_classification" if self.is_multilabel else "single_label_classification"
         )
+        label_kwargs = {}
+        if self.id2label:
+            label_kwargs["id2label"] = self.id2label
+            label_kwargs["label2id"] = {str(k): v for k, v in self.label2id.items()}
         config = AutoConfig.from_pretrained(
             model_path,
             num_labels=self.num_labels,
             problem_type=problem_type,
+            **label_kwargs,
         )
 
         drop = float(dropout)
@@ -624,22 +675,27 @@ class BERTuneClassifier:
     def _get_probs(self, predictions: np.ndarray) -> np.ndarray:
         """
         Converts raw logits to probabilities.
-        Single-label → softmax → positive-class column  shape (N,)
+        Binary       → softmax → positive-class column  shape (N,)
+        Multiclass   → softmax over classes             shape (N, num_classes)
         Multi-label  → sigmoid                          shape (N, num_labels)
         """
         if self.is_multilabel:
             return torch.sigmoid(torch.from_numpy(predictions)).numpy()
-        else:
-            return F.softmax(torch.from_numpy(predictions), dim=-1).numpy()[:, 1]
+        probs = F.softmax(torch.from_numpy(predictions), dim=-1).numpy()
+        return probs[:, 1] if self.is_binary else probs
 
     def _optimize_threshold(self, val_res):
         """
         Finds the best classification threshold(s) on the validation set.
 
-        Single-label → one scalar threshold (maximises F1).
+        Binary       → one scalar threshold (maximises F1).
+        Multiclass   → None (predictions are argmax; thresholds don't apply).
         Multi-label  → one threshold per label (maximises macro-F1);
                        returns np.ndarray of shape (num_labels,).
         """
+        if not self.is_multilabel and not self.is_binary:
+            return None
+
         probs = self._get_probs(val_res.predictions)
         labels = val_res.label_ids
 
@@ -695,7 +751,7 @@ class BERTuneClassifier:
                     ),
                     "Threshold": str(np.round(thresh, 3).tolist()),
                 }
-            else:
+            elif self.is_binary:
                 # thresh is a scalar; p is (N,)
                 preds = (p >= thresh).astype(int)
                 return {
@@ -708,6 +764,32 @@ class BERTuneClassifier:
                     "AP": average_precision_score(y, p),
                     "AUC": roc_auc_score(y, p) if len(np.unique(y)) > 1 else 0.5,
                     "Threshold": thresh,
+                }
+            else:
+                # Multiclass: thresh is None; p is (N, num_classes), argmax predictions
+                preds = p.argmax(axis=1)
+                all_classes_present = len(np.unique(y)) == p.shape[1]
+                return {
+                    "Split": split,
+                    "Accuracy": accuracy_score(y, preds),
+                    "Precision": precision_score(y, preds, average="macro", zero_division=0),
+                    "Recall": recall_score(y, preds, average="macro", zero_division=0),
+                    "F1": f1_score(y, preds, average="macro", zero_division=0),
+                    "AP": (
+                        average_precision_score(
+                            label_binarize(y, classes=np.arange(p.shape[1])),
+                            p,
+                            average="macro",
+                        )
+                        if all_classes_present
+                        else 0.5
+                    ),
+                    "AUC": (
+                        roc_auc_score(y, p, multi_class="ovr", average="macro")
+                        if all_classes_present
+                        else 0.5
+                    ),
+                    "Threshold": None,
                 }
 
         return pd.DataFrame(
@@ -738,6 +820,7 @@ class BERTuneClassifier:
                 "is_multilabel": self.is_multilabel,
                 "target_cols": self.target_cols,
                 "max_length": max_length if max_length is not None else self.max_length,
+                "id2label": self.id2label,
             },
             "parameters": self.best_params,
         }

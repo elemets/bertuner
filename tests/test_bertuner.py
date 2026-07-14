@@ -413,3 +413,112 @@ class TestLongContext:
         assert cfg.hidden_dropout_prob == 0.25
         assert cfg.attention_probs_dropout_prob == 0.25
         assert cfg.classifier_dropout == 0.25
+
+
+# ------------------------------------------------------------------
+# Label encoding
+# ------------------------------------------------------------------
+
+
+class TestLabelEncoding:
+    def test_contiguous_int_labels_untouched(self, tmp_path):
+        clf = make_classifier(tmp_path)
+        assert clf.label2id is None
+        assert clf.id2label is None
+
+    def test_string_labels_encoded(self, tmp_path):
+        df = make_df()
+        df["target"] = np.where(df["target"] == 1, "spam", "ham")
+        clf = make_classifier(tmp_path, dataframe=df)
+        assert clf.label2id == {"ham": 0, "spam": 1}
+        assert clf.id2label == {0: "ham", 1: "spam"}
+        assert sorted(clf.df["target"].unique()) == [0, 1]
+        assert clf.num_labels == 2
+
+    def test_noncontiguous_int_labels_remapped(self, tmp_path):
+        df = make_df()
+        df["target"] = df["target"] + 1  # labels 1, 2
+        clf = make_classifier(tmp_path, dataframe=df)
+        assert clf.label2id == {1: 0, 2: 1}
+        assert sorted(clf.df["target"].unique()) == [0, 1]
+
+    def test_multilabel_skips_encoding(self, tmp_path):
+        cols = ["l1", "l2"]
+        clf = make_classifier(
+            tmp_path, target_cols=cols, dataframe=make_df(multilabel_cols=cols)
+        )
+        assert clf.label2id is None
+
+    def test_id2label_saved_in_config(self, tmp_path):
+        df = make_df()
+        df["target"] = np.where(df["target"] == 1, "yes", "no")
+        clf = make_classifier(tmp_path, dataframe=df)
+        clf.best_params = {"model": "bert-base"}
+        clf.best_threshold = 0.5
+        clf._save_model(str(tmp_path), MagicMock(), MagicMock(), "bert-base-uncased")
+        with open(tmp_path / "model" / "bertuner_config.json") as f:
+            config = json.load(f)
+        assert config["model_metadata"]["id2label"] == {"0": "no", "1": "yes"}
+
+
+# ------------------------------------------------------------------
+# Multiclass (3+ classes, single-label)
+# ------------------------------------------------------------------
+
+
+class TestMulticlass:
+    def make_multiclass(self, tmp_path, n_classes=3):
+        return make_classifier(tmp_path, dataframe=make_df(num_classes=n_classes))
+
+    def test_is_binary_flags(self, tmp_path):
+        assert make_classifier(tmp_path).is_binary
+        assert not self.make_multiclass(tmp_path).is_binary
+
+    def test_get_probs_returns_full_matrix(self, tmp_path):
+        clf = self.make_multiclass(tmp_path)
+        logits = np.array([[2.0, 0.5, -1.0], [0.1, 3.0, 0.2]])
+        probs = clf._get_probs(logits)
+        assert probs.shape == (2, 3)
+        np.testing.assert_allclose(probs.sum(axis=1), 1.0, rtol=1e-5)
+
+    def test_optimize_threshold_returns_none(self, tmp_path):
+        clf = self.make_multiclass(tmp_path)
+        res = SimpleNamespace(
+            predictions=np.array([[2.0, 0.5, -1.0]]), label_ids=np.array([0])
+        )
+        assert clf._optimize_threshold(res) is None
+
+    def test_compute_metrics_does_not_crash(self, tmp_path):
+        clf = self.make_multiclass(tmp_path)
+        logits = np.array(
+            [[3.0, 0.0, 0.0], [0.0, 3.0, 0.0], [0.0, 0.0, 3.0], [3.0, 0.0, 0.0]]
+        )
+        labels = np.array([0, 1, 2, 0])
+        metrics = clf._compute_metrics((logits, labels))
+        assert metrics["accuracy"] == 1.0
+        assert metrics["f1"] == 1.0
+        assert metrics["auc_roc"] == 1.0
+        assert "specificity" not in metrics
+
+    def test_compute_metrics_missing_class_falls_back(self, tmp_path):
+        clf = self.make_multiclass(tmp_path)
+        logits = np.array([[3.0, 0.0, 0.0], [0.0, 3.0, 0.0]])
+        labels = np.array([0, 1])  # class 2 absent from eval split
+        metrics = clf._compute_metrics((logits, labels))
+        assert metrics["auc_roc"] == 0.5
+
+    def test_build_metrics_df_argmax(self, tmp_path):
+        clf = self.make_multiclass(tmp_path)
+        y = np.array([0, 1, 2, 1])
+        p = np.array(
+            [
+                [0.8, 0.1, 0.1],
+                [0.1, 0.8, 0.1],
+                [0.1, 0.1, 0.8],
+                [0.2, 0.7, 0.1],
+            ]
+        )
+        df = clf._build_metrics_df(y, p, y, p, thresh=None)
+        assert df.iloc[0]["Accuracy"] == 1.0
+        assert df.iloc[0]["F1"] == 1.0
+        assert df.iloc[0]["Threshold"] is None

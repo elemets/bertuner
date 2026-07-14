@@ -2,6 +2,8 @@
 
 A library for hyperparameter optimization and fine-tuning of BERT-based classification models. It integrates **Optuna** for efficient search and **MLflow** for experiment tracking.
 
+Supports both classic 512-token encoders (BERT, RoBERTa, DistilBERT, ELECTRA) and long-context models such as **ModernBERT** (8192 tokens). Per-architecture dropout is applied automatically, `max_length` is clamped to each model's real context window, precision is bf16 where the GPU supports it, and gradient checkpointing switches on automatically for sequences longer than 1024 tokens (override with `gradient_checkpointing=True/False`).
+
 ## Setup
 Ensure you have a local MLflow server running before execution:
 ```bash

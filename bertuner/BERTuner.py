@@ -417,6 +417,10 @@ class BERTuneClassifier:
             if hasattr(config, attr):
                 setattr(config, attr, drop)
 
+        # ModernBERT's compiled-MLP fast path crashes under gradient checkpointing
+        if hasattr(config, "reference_compile"):
+            config.reference_compile = False
+
         return AutoModelForSequenceClassification.from_pretrained(model_path, config=config)
 
     # ------------------------------------------------------------------

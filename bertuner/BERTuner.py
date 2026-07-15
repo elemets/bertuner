@@ -100,6 +100,9 @@ class BERTuneClassifier:
             # Accepts a plain path (converted to file: URI) or any mlflow URI.
             if "://" not in mlflow_tracking_uri:
                 mlflow_tracking_uri = f"file:{os.path.abspath(mlflow_tracking_uri)}"
+            if mlflow_tracking_uri.startswith("file:"):
+                # mlflow >=3.14 rejects the filesystem backend unless opted in
+                os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
             self.mlflow_uri = mlflow_tracking_uri
         else:
             self.mlflow_uri = f"http://127.0.0.1:{mlflow_port}"

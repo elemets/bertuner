@@ -7,8 +7,7 @@ Supports both classic 512-token encoders (BERT, RoBERTa, DistilBERT, ELECTRA) an
 ## Installation
 
 ```bash
-pip install bertuner[train]     # training + inference
-pip install bertuner            # inference only (BERTunePredictor)
+pip install bertuner            # training + inference, batteries included
 ```
 
 From source (development):

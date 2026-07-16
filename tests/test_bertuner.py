@@ -485,3 +485,98 @@ class TestMulticlass:
         assert df.iloc[0]["Accuracy"] == 1.0
         assert df.iloc[0]["F1"] == 1.0
         assert df.iloc[0]["Threshold"] is None
+
+
+# ------------------------------------------------------------------
+# Multiclass weighted loss (regression: pre-0.1.0 code always built
+# 2-element class weights, crashing cross_entropy on 3+ classes)
+# ------------------------------------------------------------------
+
+
+class TestMulticlassWeightedLoss:
+    """Weighted CE with 3 classes must not raise the shape-[2] weight error."""
+
+    def _trainer(self, class_weights, loss_type="weighted"):
+        import torch
+        from bertuner.CustomTrainer import CustomTrainer
+
+        t = CustomTrainer.__new__(CustomTrainer)
+        t.loss_type = loss_type
+        t.class_weights = class_weights
+        return t
+
+    def test_weighted_ce_three_classes(self, tmp_path):
+        import torch
+
+        clf = make_classifier(tmp_path, dataframe=make_df(num_classes=3))
+        ds = [{"labels": torch.tensor(i % 3)} for i in range(9)]
+        weights = clf._compute_class_weights(ds)
+        assert weights.shape == (3,)
+
+        trainer = self._trainer(weights)
+        logits = torch.randn(6, 3)
+        labels = torch.tensor([0, 1, 2, 0, 1, 2])
+        loss = trainer._singlelabel_loss(logits, labels, torch.device("cpu"))
+        assert torch.isfinite(loss)
+
+    def test_two_element_weights_reproduce_reported_error(self):
+        import torch
+
+        trainer = self._trainer(torch.tensor([1.0, 3.0]))
+        logits = torch.randn(6, 3)
+        labels = torch.tensor([0, 1, 2, 0, 1, 2])
+        with pytest.raises(RuntimeError, match="weight tensor"):
+            trainer._singlelabel_loss(logits, labels, torch.device("cpu"))
+
+    def test_focal_and_label_smoothing_three_classes(self, tmp_path):
+        import torch
+
+        logits = torch.randn(6, 3)
+        labels = torch.tensor([0, 1, 2, 0, 1, 2])
+        for loss_type in ("focal", "label_smoothing", "plain"):
+            trainer = self._trainer(None, loss_type=loss_type)
+            loss = trainer._singlelabel_loss(logits, labels, torch.device("cpu"))
+            assert torch.isfinite(loss)
+
+    def test_end_to_end_training_three_classes(self, tmp_path):
+        import torch
+        from transformers import (
+            AutoModelForSequenceClassification,
+            AutoTokenizer,
+            DataCollatorWithPadding,
+            TrainingArguments,
+        )
+        from bertuner.CustomTrainer import CustomTrainer
+
+        model_path = "prajjwal1/bert-tiny"
+        clf = make_classifier(tmp_path, dataframe=make_df(n=60, num_classes=3))
+        assert clf.num_labels == 3
+
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        train_ds, val_ds, _ = clf._prepare_datasets(tokenizer, None, max_length=32)
+        class_weights = clf._compute_class_weights(train_ds)
+        assert class_weights.shape == (3,)
+
+        model = AutoModelForSequenceClassification.from_pretrained(
+            model_path, num_labels=3
+        )
+        args = TrainingArguments(
+            output_dir=str(tmp_path / "e2e"),
+            per_device_train_batch_size=8,
+            num_train_epochs=1,
+            eval_strategy="no",
+            save_strategy="no",
+            report_to=["none"],
+            seed=42,
+        )
+        trainer = CustomTrainer(
+            model=model,
+            args=args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            data_collator=DataCollatorWithPadding(tokenizer),
+            loss_type="weighted",
+            class_weights=class_weights,
+        )
+        result = trainer.train()
+        assert np.isfinite(result.training_loss)

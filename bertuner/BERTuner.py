@@ -499,6 +499,7 @@ class BERTuneClassifier:
             num_train_epochs=6,
             save_total_limit=2,
             load_best_model_at_end=True,
+            logging_strategy="epoch",
             seed=self.seed,
             remove_unused_columns=True,
             report_to=["none"],
@@ -525,6 +526,7 @@ class BERTuneClassifier:
                 trainer.train()
                 metrics = trainer.evaluate()
                 mlflow.log_metrics(metrics)
+                self._log_loss_curve(trainer.state.log_history)
         else:
             trainer.train()
             metrics = trainer.evaluate()
@@ -606,6 +608,7 @@ class BERTuneClassifier:
             greater_is_better=self.greater_is_better,
             save_total_limit=2,
             load_best_model_at_end=True,
+            logging_strategy="epoch",
             report_to=["tensorboard", "mlflow"],
             logging_dir=f"{final_dir}/logs",
             seed=self.seed,
@@ -645,13 +648,64 @@ class BERTuneClassifier:
             )
 
             mlflow.log_params(self.best_params)
-            for _, row in metrics_df.iterrows():
-                for m in ["Accuracy", "F1", "AUC"]:
-                    mlflow.log_metric(f"{row['Split']}_{m}", row[m])
+            self._log_final_metrics(metrics_df)
+            self._log_loss_curve(trainer.state.log_history)
 
             self._save_model(final_dir, trainer, tokenizer, model_path, max_length)
 
         return metrics_df, model, test_ds
+
+    def _log_final_metrics(self, metrics_df):
+        """Logs the final validation and test metrics with descriptive names."""
+        metric_names = {
+            "Accuracy": "Accuracy",
+            "F1": "F1",
+            "AP": "Average_Precision",
+            "AUC": "AUROC",
+        }
+        for _, row in metrics_df.iterrows():
+            for column, metric_name in metric_names.items():
+                mlflow.log_metric(
+                    f"{row['Split']}_{metric_name}", float(row[column])
+                )
+
+    def _log_loss_curve(self, log_history):
+        """Logs an epoch-level training-vs-evaluation loss plot to MLflow."""
+        train_points = [
+            (entry.get("epoch", entry.get("step")), entry["loss"])
+            for entry in log_history
+            if "loss" in entry
+        ]
+        eval_points = [
+            (entry.get("epoch", entry.get("step")), entry["eval_loss"])
+            for entry in log_history
+            if "eval_loss" in entry
+        ]
+
+        if not train_points or not eval_points:
+            return
+
+        # Import lazily so metric-only use of BERTuner does not initialise a
+        # plotting backend or matplotlib cache.
+        import matplotlib.pyplot as plt
+
+        fig, ax = plt.subplots(figsize=(8, 5))
+        try:
+            train_x, train_loss = zip(*train_points)
+            eval_x, eval_loss = zip(*eval_points)
+            ax.plot(train_x, train_loss, marker="o", label="Training loss")
+            ax.plot(eval_x, eval_loss, marker="o", label="Evaluation loss")
+            ax.set(
+                title="Training vs Evaluation Loss",
+                xlabel="Epoch",
+                ylabel="Loss",
+            )
+            ax.grid(alpha=0.3)
+            ax.legend()
+            fig.tight_layout()
+            mlflow.log_figure(fig, "plots/training_vs_evaluation_loss.png")
+        finally:
+            plt.close(fig)
 
     # ------------------------------------------------------------------
     # Threshold optimisation

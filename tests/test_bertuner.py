@@ -268,6 +268,67 @@ class TestBuildMetricsDf:
         assert "F1_micro" in df.columns
 
 
+class TestLossCurveLogging:
+    def test_logs_average_precision_and_auroc(self, tmp_path, monkeypatch):
+        clf = make_classifier(tmp_path)
+        logged = MagicMock()
+        monkeypatch.setattr("bertuner.BERTuner.mlflow.log_metric", logged)
+        metrics = pd.DataFrame(
+            [
+                {
+                    "Split": "Validation",
+                    "Accuracy": 0.7,
+                    "F1": 0.6,
+                    "AP": 0.8,
+                    "AUC": 0.9,
+                },
+                {
+                    "Split": "Test",
+                    "Accuracy": 0.65,
+                    "F1": 0.55,
+                    "AP": 0.75,
+                    "AUC": 0.85,
+                },
+            ]
+        )
+
+        clf._log_final_metrics(metrics)
+
+        calls = {call.args[0]: call.args[1] for call in logged.call_args_list}
+        assert calls["Validation_Average_Precision"] == 0.8
+        assert calls["Validation_AUROC"] == 0.9
+        assert calls["Test_Average_Precision"] == 0.75
+        assert calls["Test_AUROC"] == 0.85
+
+    def test_logs_training_and_eval_loss_figure(self, tmp_path, monkeypatch):
+        clf = make_classifier(tmp_path)
+        logged = MagicMock()
+        monkeypatch.setattr("bertuner.BERTuner.mlflow.log_figure", logged)
+
+        clf._log_loss_curve(
+            [
+                {"loss": 0.8, "epoch": 1.0},
+                {"eval_loss": 0.9, "epoch": 1.0},
+                {"loss": 0.5, "epoch": 2.0},
+                {"eval_loss": 0.7, "epoch": 2.0},
+            ]
+        )
+
+        logged.assert_called_once()
+        assert logged.call_args.args[1] == "plots/training_vs_evaluation_loss.png"
+
+    def test_skips_figure_when_either_loss_series_is_missing(
+        self, tmp_path, monkeypatch
+    ):
+        clf = make_classifier(tmp_path)
+        logged = MagicMock()
+        monkeypatch.setattr("bertuner.BERTuner.mlflow.log_figure", logged)
+
+        clf._log_loss_curve([{"eval_loss": 0.9, "epoch": 1.0}])
+
+        logged.assert_not_called()
+
+
 # ------------------------------------------------------------------
 # Saving
 # ------------------------------------------------------------------

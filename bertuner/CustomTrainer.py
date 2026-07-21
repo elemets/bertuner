@@ -1,15 +1,98 @@
-from transformers import Trainer
 import torch
 import torch.nn.functional as F
+from transformers import Trainer, TrainerCallback
+
+from bertuner.exceptions import NonFiniteTrainingError
+
+
+class NonFiniteGradientCallback(TrainerCallback):
+    """Abort before optimizer.step() when any clipped gradient is NaN or Inf."""
+
+    def __init__(self, precision: str | None = None):
+        self.precision = precision
+
+    @staticmethod
+    def _gradient_values(gradient: torch.Tensor) -> torch.Tensor:
+        return gradient.coalesce().values() if gradient.is_sparse else gradient
+
+    def on_pre_optimizer_step(self, args, state, control, model=None, **kwargs):
+        if model is None:
+            return control
+
+        # One host synchronization per device during healthy training. Individual
+        # gradients are inspected only after their device-level check fails.
+        gradients_by_device = {}
+        for name, parameter in model.named_parameters():
+            if parameter.grad is None:
+                continue
+            values = self._gradient_values(parameter.grad.detach())
+            gradients_by_device.setdefault(values.device, []).append((name, values))
+
+        for entries in gradients_by_device.values():
+            checks = torch.stack([torch.isfinite(values).all() for _, values in entries])
+            if checks.all().item():
+                continue
+            bad_name = next(
+                name for name, values in entries if not torch.isfinite(values).all().item()
+            )
+            bad_values = next(values for name, values in entries if name == bad_name)
+            nonfinite_kind = "nan" if torch.isnan(bad_values).any().item() else "inf"
+            optimizer = kwargs.get("optimizer")
+            learning_rate = (
+                optimizer.param_groups[0].get("lr")
+                if optimizer is not None and optimizer.param_groups
+                else None
+            )
+            raise NonFiniteTrainingError(
+                "backward",
+                f"gradient:{bad_name}",
+                step=state.global_step,
+                epoch=state.epoch,
+                precision=self.precision,
+                learning_rate=learning_rate,
+                nonfinite_kind=nonfinite_kind,
+            )
+
+        return control
 
 
 class CustomTrainer(Trainer):
     """Trainer supporting single-label (CE/focal/label-smoothing) and multi-label (BCE) classification."""
 
-    def __init__(self, loss_type="focal", class_weights=None, **kwargs):
-        super().__init__(**kwargs)
+    def __init__(
+        self,
+        loss_type="focal",
+        class_weights=None,
+        training_precision: str | None = None,
+        **kwargs,
+    ):
+        callbacks = list(kwargs.pop("callbacks", None) or [])
+        callbacks.append(NonFiniteGradientCallback(training_precision))
+        super().__init__(callbacks=callbacks, **kwargs)
         self.loss_type = loss_type
         self.class_weights = class_weights
+        self.training_precision = training_precision
+
+    def _require_finite(self, tensor: torch.Tensor, stage: str, tensor_name: str):
+        if torch.isfinite(tensor.detach()).all().item():
+            return
+        detached = tensor.detach()
+        nonfinite_kind = "nan" if torch.isnan(detached).any().item() else "inf"
+        optimizer = getattr(self, "optimizer", None)
+        learning_rate = (
+            optimizer.param_groups[0].get("lr")
+            if optimizer is not None and optimizer.param_groups
+            else None
+        )
+        raise NonFiniteTrainingError(
+            stage,
+            tensor_name,
+            step=self.state.global_step,
+            epoch=self.state.epoch,
+            precision=self.training_precision,
+            learning_rate=learning_rate,
+            nonfinite_kind=nonfinite_kind,
+        )
 
     def _is_multilabel(self, labels: torch.Tensor) -> bool:
         """Multi-label labels are 2D float vectors; single-label are 1D integer class indices."""
@@ -87,6 +170,7 @@ class CustomTrainer(Trainer):
 
         outputs = model(**inputs)
         logits = outputs.logits
+        self._require_finite(logits, "forward", "logits")
 
         # ── Label sanity check (catches mismatches early, CPU-side) ──────────
         if not self._is_multilabel(labels):
@@ -105,5 +189,7 @@ class CustomTrainer(Trainer):
             loss = self._multilabel_loss(logits, labels, device)
         else:
             loss = self._singlelabel_loss(logits, labels, device)
+
+        self._require_finite(loss, "loss", "loss")
 
         return (loss, outputs) if return_outputs else loss

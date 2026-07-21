@@ -2,6 +2,7 @@ import os
 import random
 import json
 import shutil
+import warnings
 import numpy as np
 import pandas as pd
 import torch
@@ -37,6 +38,7 @@ from sklearn.preprocessing import label_binarize
 from mlflow.tracking import MlflowClient
 
 from bertuner.CustomTrainer import CustomTrainer
+from bertuner.exceptions import NonFiniteTrainingError, NoStableTrialError
 from bertuner.TensorBoardCallback import (
     TensorBoardSyncCallback,
     CleanupCheckpointsCallback,
@@ -81,11 +83,28 @@ class BERTuneClassifier:
         log_level: str = "best",
         max_length: int = 512,
         gradient_checkpointing: bool = None,
+        precision: str = "auto",
+        retry_nonfinite_in_fp32: bool = True,
+        max_grad_norm: float | None = 1.0,
+        class_weight_warning_threshold: float | None = 100.0,
     ):
         if data_path is None and dataframe is None:
             raise ValueError("Provide either data_path (CSV) or dataframe, not neither.")
         if data_path is not None and dataframe is not None:
             raise ValueError("Provide either data_path (CSV) or dataframe, not both.")
+        if precision not in {"auto", "fp32", "bf16", "fp16"}:
+            raise ValueError("precision must be one of: 'auto', 'fp32', 'bf16', 'fp16'.")
+        if max_grad_norm is not None and (
+            not np.isfinite(max_grad_norm) or max_grad_norm <= 0
+        ):
+            raise ValueError("max_grad_norm must be a positive finite number or None.")
+        if class_weight_warning_threshold is not None and (
+            not np.isfinite(class_weight_warning_threshold)
+            or class_weight_warning_threshold <= 0
+        ):
+            raise ValueError(
+                "class_weight_warning_threshold must be a positive finite number or None."
+            )
 
         self.data_path = data_path
         self.models_dir = models_dir
@@ -114,12 +133,19 @@ class BERTuneClassifier:
             self.mlflow_uri = f"http://127.0.0.1:{mlflow_port}"
         self.log_level = log_level  # 'best' or 'verbose'
         self.best_params = {}
+        self.best_precision = None
+        self.best_precision_fallback = False
         # Single-label: scalar float. Multi-label: array of per-label floats.
         self.best_threshold = 0.5
         self.max_length = max_length
         # None → auto: enabled when the effective sequence length is long enough
         # that activation memory dominates (see _use_gradient_checkpointing).
         self.gradient_checkpointing = gradient_checkpointing
+        self.precision = precision
+        self.retry_nonfinite_in_fp32 = retry_nonfinite_in_fp32
+        self.max_grad_norm = max_grad_norm
+        self.class_weight_warning_threshold = class_weight_warning_threshold
+        self._active_precision = None
         self._setup_seed()
         if self.mlflow_uri.startswith("http"):
             print(f"Please make sure an mlflow instance is running on: {self.mlflow_uri}")
@@ -200,10 +226,39 @@ class BERTuneClassifier:
             )
         return min(self.max_length, capacity)
 
-    def _precision_flags(self) -> dict:
-        """bf16 where the GPU supports it (required for ModernBERT), else fp16."""
-        bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
-        return {"bf16": bf16, "fp16": torch.cuda.is_available() and not bf16}
+    def _resolve_precision(self) -> str:
+        """Resolve requested precision and reject unsupported explicit modes."""
+        if self.precision == "auto":
+            if not torch.cuda.is_available():
+                return "fp32"
+            return "bf16" if torch.cuda.is_bf16_supported() else "fp16"
+        if self.precision == "bf16" and (
+            not torch.cuda.is_available() or not torch.cuda.is_bf16_supported()
+        ):
+            raise ValueError("precision='bf16' requires a CUDA GPU with BF16 support.")
+        if self.precision == "fp16" and not torch.cuda.is_available():
+            raise ValueError("precision='fp16' requires a CUDA GPU.")
+        return self.precision
+
+    def _precision_flags(self, effective_precision: str | None = None) -> dict:
+        """Return Transformers precision flags for one training attempt."""
+        effective_precision = effective_precision or self._resolve_precision()
+        return {
+            "bf16": effective_precision == "bf16",
+            "fp16": effective_precision == "fp16",
+        }
+
+    @staticmethod
+    def _require_finite_array(values, stage: str, tensor_name: str, precision=None):
+        values = np.asarray(values)
+        if np.isfinite(values).all():
+            return
+        raise NonFiniteTrainingError(
+            stage,
+            tensor_name,
+            precision=precision,
+            nonfinite_kind="nan" if np.isnan(values).any() else "inf",
+        )
 
     def _use_gradient_checkpointing(self, max_length: int) -> bool:
         """Auto-enables checkpointing for long sequences unless explicitly overridden."""
@@ -227,6 +282,12 @@ class BERTuneClassifier:
                      Jaccard scores, ranking metrics, MCC, Brier score, and log loss.
         """
         predictions, labels = eval_pred
+        self._require_finite_array(
+            predictions,
+            "evaluation",
+            "logits",
+            self._active_precision,
+        )
 
         if self.is_multilabel:
             # predictions shape: (N, num_labels) — raw logits
@@ -498,21 +559,59 @@ class BERTuneClassifier:
         if self.is_multilabel:
             # Stack all label vectors: shape (N, num_labels)
             all_labels = torch.stack([item["labels"] for item in train_ds]).numpy()
-            pos_counts = all_labels.sum(axis=0).clip(min=1)
-            neg_counts = (len(all_labels) - all_labels.sum(axis=0)).clip(min=1)
+            if not np.isfinite(all_labels).all():
+                raise ValueError("Training labels contain NaN or Inf; class weights are invalid.")
+            raw_pos_counts = all_labels.sum(axis=0)
+            raw_neg_counts = len(all_labels) - raw_pos_counts
+            pos_counts = raw_pos_counts.clip(min=1)
+            neg_counts = raw_neg_counts.clip(min=1)
             pos_weight = neg_counts / pos_counts  # shape (num_labels,)
-            return torch.tensor(pos_weight, dtype=torch.float)
+            weights = torch.tensor(pos_weight, dtype=torch.float)
+            descriptions = [
+                f"label={name}, positives={raw_pos_counts[i]:g}, "
+                f"negatives={raw_neg_counts[i]:g}, weight={pos_weight[i]:g}"
+                for i, name in enumerate(self.target_cols)
+            ]
         elif self.is_binary:
             labels = [item["labels"].item() for item in train_ds]
             neg = labels.count(0)
             pos = labels.count(1)
-            pos = max(pos, 1)
-            return torch.tensor([1.0, neg / pos], dtype=torch.float)
+            pos_weight = neg / max(pos, 1)
+            weights = torch.tensor([1.0, pos_weight], dtype=torch.float)
+            descriptions = [
+                f"class=0, count={neg}, weight=1",
+                f"class=1, positives={pos}, negatives={neg}, weight={pos_weight:g}",
+            ]
         else:
             labels = [item["labels"].item() for item in train_ds]
-            counts = np.bincount(labels, minlength=self.num_labels).clip(min=1)
-            weights = len(labels) / (self.num_labels * counts)
-            return torch.tensor(weights, dtype=torch.float)
+            raw_counts = np.bincount(labels, minlength=self.num_labels)
+            counts = raw_counts.clip(min=1)
+            raw_weights = len(labels) / (self.num_labels * counts)
+            weights = torch.tensor(raw_weights, dtype=torch.float)
+            descriptions = [
+                f"class={i}, count={raw_counts[i]}, weight={raw_weights[i]:g}"
+                for i in range(self.num_labels)
+            ]
+
+        if not torch.isfinite(weights).all().item():
+            raise ValueError(
+                "Computed class weights contain NaN or Inf: " + "; ".join(descriptions)
+            )
+
+        threshold = self.class_weight_warning_threshold
+        if threshold is not None:
+            large = [
+                description
+                for description, weight in zip(descriptions, weights.tolist())
+                if weight > threshold
+            ]
+            if large:
+                warnings.warn(
+                    "Large class weight(s) may destabilize training: " + "; ".join(large),
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        return weights
 
     # ------------------------------------------------------------------
     # Hyperparameter suggestion
@@ -566,8 +665,171 @@ class BERTuneClassifier:
     # Optuna objective
     # ------------------------------------------------------------------
 
+    def _build_training_arguments(
+        self,
+        params,
+        output_dir,
+        max_length,
+        precision,
+        *,
+        final=False,
+        logging_dir=None,
+    ):
+        """Build attempt-local arguments with explicit precision and clipping."""
+        kwargs = {
+            "output_dir": output_dir,
+            "learning_rate": params["learning_rate"],
+            "per_device_train_batch_size": params["batch_size"],
+            "per_device_eval_batch_size": params["batch_size"],
+            "gradient_accumulation_steps": params.get("gradient_accumulation_steps", 1),
+            "gradient_checkpointing": self._use_gradient_checkpointing(max_length),
+            "gradient_checkpointing_kwargs": {"use_reentrant": False},
+            "weight_decay": params["weight_decay"],
+            "warmup_ratio": params["warmup_ratio"],
+            "metric_for_best_model": f"eval_{self.optimize_metric}",
+            "greater_is_better": self.greater_is_better,
+            "eval_strategy": "epoch",
+            "save_strategy": "epoch",
+            "num_train_epochs": 6,
+            "save_total_limit": 2,
+            "load_best_model_at_end": True,
+            "logging_strategy": "epoch",
+            "logging_nan_inf_filter": False,
+            "max_grad_norm": 0.0 if self.max_grad_norm is None else self.max_grad_norm,
+            "seed": self.seed,
+            **self._precision_flags(precision),
+        }
+        if final:
+            # Canonical final metrics are logged explicitly after restoring the
+            # best checkpoint; Trainer only sends loss curves to TensorBoard.
+            kwargs.update(report_to=["tensorboard"], logging_dir=logging_dir)
+        else:
+            kwargs.update(
+                lr_scheduler_type=params["scheduler"],
+                remove_unused_columns=True,
+                report_to=["none"],
+            )
+        return TrainingArguments(**kwargs)
+
+    def _build_trainer(
+        self,
+        model,
+        args,
+        train_ds,
+        val_ds,
+        tokenizer,
+        params,
+        class_weights,
+        precision,
+        *,
+        final=False,
+        logging_dir=None,
+    ):
+        callbacks = [
+            EarlyStoppingCallback(
+                early_stopping_patience=params["early_stopping_patience"]
+            )
+        ]
+        if final:
+            callbacks.extend(
+                [
+                    TensorBoardSyncCallback(logging_dir),
+                    CleanupCheckpointsCallback,
+                ]
+            )
+        return CustomTrainer(
+            model=model,
+            args=args,
+            train_dataset=train_ds,
+            eval_dataset=val_ds,
+            data_collator=DataCollatorWithPadding(tokenizer),
+            compute_metrics=self._compute_metrics,
+            callbacks=callbacks,
+            loss_type=params.get("loss_type", "weighted"),
+            class_weights=class_weights,
+            training_precision=precision,
+        )
+
+    def _run_training_attempt(
+        self,
+        params,
+        model_path,
+        tokenizer,
+        train_ds,
+        val_ds,
+        class_weights,
+        max_length,
+        precision,
+        output_dir,
+        *,
+        final=False,
+        logging_dir=None,
+    ):
+        """Run one fresh attempt. Callers own retry and cleanup policy."""
+        self._setup_seed()
+        self._active_precision = precision
+        model = self._load_model(model_path, params["dropout"])
+        if precision == "fp32":
+            # Some checkpoints declare a reduced torch_dtype in config. Force
+            # fallback weights to FP32 instead of only disabling autocast.
+            model = model.float()
+        args = self._build_training_arguments(
+            params,
+            output_dir,
+            max_length,
+            precision,
+            final=final,
+            logging_dir=logging_dir,
+        )
+        trainer = self._build_trainer(
+            model,
+            args,
+            train_ds,
+            val_ds,
+            tokenizer,
+            params,
+            class_weights,
+            precision,
+            final=final,
+            logging_dir=logging_dir,
+        )
+        try:
+            trainer.train()
+        except Exception:
+            # Trainer does not emit on_train_end after an exception. Close only
+            # BERTuner-owned writers before the caller decides whether to retry.
+            for callback in trainer.callback_handler.callbacks:
+                if isinstance(callback, TensorBoardSyncCallback):
+                    callback.writer.close()
+            raise
+        return trainer, model
+
+    def _attempt_precisions(self, initial_precision):
+        attempts = [initial_precision]
+        if self.retry_nonfinite_in_fp32 and initial_precision != "fp32":
+            attempts.append("fp32")
+        return attempts
+
+    @staticmethod
+    def _attempt_directory(base_dir, precision):
+        return os.path.join(base_dir, "fp32" if precision == "fp32" else "mixed")
+
+    @staticmethod
+    def _record_nonfinite_trial_failure(trial, prefix, error):
+        trial.set_user_attr(f"{prefix}_failure_reason", str(error))
+        trial.set_user_attr(f"{prefix}_failure_stage", error.stage)
+        trial.set_user_attr(f"{prefix}_failure_tensor", error.tensor_name)
+        if error.step is not None:
+            trial.set_user_attr(f"{prefix}_failure_step", error.step)
+        if error.epoch is not None:
+            trial.set_user_attr(f"{prefix}_failure_epoch", error.epoch)
+        if error.learning_rate is not None:
+            trial.set_user_attr(f"{prefix}_failure_learning_rate", error.learning_rate)
+        if error.nonfinite_kind is not None:
+            trial.set_user_attr(f"{prefix}_failure_kind", error.nonfinite_kind)
+
     def _objective(self, trial):
-        """Optuna objective function with conditional logging."""
+        """Run one trial, retrying verified mixed-precision failures in FP32."""
         params = self._suggest_hyperparams(trial)
         model_path = self.MODEL_CHOICES[params["model"]]
         self._setup_seed()
@@ -579,63 +841,76 @@ class BERTuneClassifier:
         )
 
         class_weights = self._compute_class_weights(self.train_ds)
-        model = self._load_model(model_path, params["dropout"])
-
-        output_dir = f"{self.models_dir}/optuna_trial_{trial.number}"
+        base_dir = f"{self.models_dir}/optuna_trial_{trial.number}"
         optimize_metric_key = f"eval_{self.optimize_metric}"
+        initial_precision = self._resolve_precision()
+        attempts = self._attempt_precisions(initial_precision)
+        trial.set_user_attr("initial_precision", initial_precision)
+        trial.set_user_attr("precision_fallback", False)
 
-        args = TrainingArguments(
-            output_dir=output_dir,
-            learning_rate=params["learning_rate"],
-            per_device_train_batch_size=params["batch_size"],
-            per_device_eval_batch_size=params["batch_size"],
-            gradient_accumulation_steps=params.get("gradient_accumulation_steps", 1),
-            gradient_checkpointing=self._use_gradient_checkpointing(max_length),
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-            weight_decay=params["weight_decay"],
-            warmup_ratio=params["warmup_ratio"],
-            metric_for_best_model=optimize_metric_key,
-            greater_is_better=self.greater_is_better,
-            lr_scheduler_type=params["scheduler"],
-            eval_strategy="epoch",
-            save_strategy="epoch",
-            num_train_epochs=6,
-            save_total_limit=2,
-            load_best_model_at_end=True,
-            logging_strategy="epoch",
-            seed=self.seed,
-            remove_unused_columns=True,
-            report_to=["none"],
-            **self._precision_flags(),
-        )
+        def run_attempts():
+            if self.log_level == "verbose":
+                mlflow.log_params(params)
+                mlflow.set_tag("requested_precision", self.precision)
+                mlflow.set_tag("initial_precision", initial_precision)
+                mlflow.set_tag("precision_fallback", "false")
 
-        trainer = CustomTrainer(
-            model=model,
-            args=args,
-            train_dataset=self.train_ds,
-            eval_dataset=self.val_ds,
-            data_collator=DataCollatorWithPadding(tokenizer),
-            compute_metrics=self._compute_metrics,
-            callbacks=[
-                EarlyStoppingCallback(early_stopping_patience=params["early_stopping_patience"])
-            ],
-            loss_type=params.get("loss_type", "weighted"),
-            class_weights=class_weights,
-        )
+            for attempt_index, precision in enumerate(attempts):
+                attempt_dir = self._attempt_directory(base_dir, precision)
+                shutil.rmtree(attempt_dir, ignore_errors=True)
+                try:
+                    trainer, _ = self._run_training_attempt(
+                        params,
+                        model_path,
+                        tokenizer,
+                        self.train_ds,
+                        self.val_ds,
+                        class_weights,
+                        max_length,
+                        precision,
+                        attempt_dir,
+                    )
+                    metrics = trainer.evaluate()
+                except NonFiniteTrainingError as error:
+                    error.add_context(precision=precision)
+                    prefix = "initial" if attempt_index == 0 else "fp32"
+                    self._record_nonfinite_trial_failure(trial, prefix, error)
+                    shutil.rmtree(attempt_dir, ignore_errors=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+
+                    has_fallback = attempt_index + 1 < len(attempts)
+                    if has_fallback:
+                        trial.set_user_attr("precision_fallback", True)
+                        if self.log_level == "verbose":
+                            mlflow.set_tag("precision_fallback", "true")
+                            mlflow.set_tag("mixed_failure_reason", str(error))
+                        continue
+
+                    trial.set_user_attr("last_precision", precision)
+                    if self.log_level == "verbose":
+                        mlflow.set_tag("effective_precision", precision)
+                        mlflow.set_tag("nonfinite_failure_reason", str(error))
+                    shutil.rmtree(base_dir, ignore_errors=True)
+                    raise optuna.TrialPruned(str(error)) from error
+                finally:
+                    self._active_precision = None
+
+                trial.set_user_attr("effective_precision", precision)
+                trial.set_user_attr("precision_fallback", attempt_index > 0)
+                if self.log_level == "verbose":
+                    mlflow.set_tag("effective_precision", precision)
+                    mlflow.log_metrics(metrics)
+                    self._log_loss_curve(trainer.state.log_history)
+                shutil.rmtree(base_dir, ignore_errors=True)
+                return metrics.get(optimize_metric_key, 0.0)
+
+            raise AssertionError("Precision attempt loop exited without a result.")
 
         if self.log_level == "verbose":
             with mlflow.start_run(run_name=f"trial_{trial.number}"):
-                mlflow.log_params(params)
-                trainer.train()
-                metrics = trainer.evaluate()
-                mlflow.log_metrics(metrics)
-                self._log_loss_curve(trainer.state.log_history)
-        else:
-            trainer.train()
-            metrics = trainer.evaluate()
-
-        shutil.rmtree(output_dir, ignore_errors=True)
-        return metrics.get(optimize_metric_key, 0.0)
+                return run_attempts()
+        return run_attempts()
 
     # ------------------------------------------------------------------
     # Public API: optimize
@@ -649,9 +924,9 @@ class BERTuneClassifier:
         greater_is_better: bool = True,
     ):
 
-        self.greater_is_better = greater_is_better
-
         """Runs Optuna optimization."""
+        self.greater_is_better = greater_is_better
+        self._resolve_precision()  # fail unsupported explicit precision before trial setup
         mlflow.set_tracking_uri(self.mlflow_uri)
         client = MlflowClient()
         exp_name = f"enhanced_expert_model_optimization_{study_name}"
@@ -673,8 +948,28 @@ class BERTuneClassifier:
         self.optimize_metric = optimize_metric
         study.optimize(self._objective, n_trials=n_trials)
 
+        try:
+            best_trial = study.best_trial
+        except ValueError as error:
+            failures = [
+                trial.user_attrs.get("fp32_failure_reason")
+                or trial.user_attrs.get("initial_failure_reason")
+                for trial in study.trials
+                if trial.user_attrs
+            ]
+            summary = "; ".join(failure for failure in failures if failure)
+            message = f"No numerically stable trial completed out of {len(study.trials)} trial(s)."
+            if summary:
+                message += f" Failures: {summary}"
+            message += " Lower the learning-rate range or inspect labels and class weights."
+            raise NoStableTrialError(message) from error
+
         self.best_params = study.best_params
-        self._cleanup_trials(study.best_trial.number)
+        trial_attrs = getattr(best_trial, "user_attrs", {})
+        attrs = trial_attrs if isinstance(trial_attrs, dict) else {}
+        self.best_precision = attrs.get("effective_precision", self._resolve_precision())
+        self.best_precision_fallback = bool(attrs.get("precision_fallback", False))
+        self._cleanup_trials(best_trial.number)
         return study.best_value
 
     # ------------------------------------------------------------------
@@ -682,7 +977,7 @@ class BERTuneClassifier:
     # ------------------------------------------------------------------
 
     def train_final_model(self, run_name: str = "final_model_run"):
-        """Trains the model with best parameters and evaluates on test set."""
+        """Train final model, retrying verified mixed-precision failures in FP32."""
         if not self.best_params:
             raise ValueError("Run optimize() before training final model.")
 
@@ -696,76 +991,78 @@ class BERTuneClassifier:
         )
 
         class_weights = self._compute_class_weights(train_ds)
-        model = self._load_model(model_path, self.best_params["dropout"])
-
         final_dir = f"{self.models_dir}/final_model"
-        args = TrainingArguments(
-            output_dir=final_dir,
-            eval_strategy="epoch",
-            save_strategy="epoch",
-            num_train_epochs=6,
-            learning_rate=self.best_params["learning_rate"],
-            per_device_train_batch_size=self.best_params["batch_size"],
-            per_device_eval_batch_size=self.best_params["batch_size"],
-            gradient_accumulation_steps=self.best_params.get("gradient_accumulation_steps", 1),
-            gradient_checkpointing=self._use_gradient_checkpointing(max_length),
-            gradient_checkpointing_kwargs={"use_reentrant": False},
-            weight_decay=self.best_params["weight_decay"],
-            warmup_ratio=self.best_params["warmup_ratio"],
-            metric_for_best_model=f"eval_{self.optimize_metric}",
-            greater_is_better=self.greater_is_better,
-            save_total_limit=2,
-            load_best_model_at_end=True,
-            logging_strategy="epoch",
-            # The final validation/test metrics are logged explicitly below.
-            # Sending Trainer logs to MLflow as well creates a second, misleading
-            # eval_* metric set from the last epoch rather than the restored best
-            # checkpoint.
-            report_to=["tensorboard"],
-            logging_dir=f"{final_dir}/logs",
-            seed=self.seed,
-            **self._precision_flags(),
-        )
+        logging_dir = f"{final_dir}/logs"
+        initial_precision = self.best_precision or self._resolve_precision()
+        attempts = self._attempt_precisions(initial_precision)
 
         with mlflow.start_run(run_name=run_name):
-            trainer = CustomTrainer(
-                model=model,
-                args=args,
-                train_dataset=train_ds,
-                eval_dataset=val_ds,
-                data_collator=DataCollatorWithPadding(tokenizer),
-                compute_metrics=self._compute_metrics,
-                callbacks=[
-                    EarlyStoppingCallback(
-                        early_stopping_patience=self.best_params["early_stopping_patience"]
-                    ),
-                    TensorBoardSyncCallback(f"{final_dir}/logs"),
-                    CleanupCheckpointsCallback,
-                ],
-                loss_type=self.best_params.get("loss_type", "weighted"),
-                class_weights=class_weights,
-            )
-            trainer.train()
-
-            val_res = trainer.predict(val_ds)
-            self.best_threshold = self._optimize_threshold(val_res)
-
-            test_res = trainer.predict(test_ds)
-            metrics_df = self._build_metrics_df(
-                val_res.label_ids,
-                self._get_probs(val_res.predictions),
-                test_res.label_ids,
-                self._get_probs(test_res.predictions),
-                self.best_threshold,
-            )
-
             mlflow.log_params(self.best_params)
-            self._log_final_metrics(metrics_df)
-            self._log_loss_curve(trainer.state.log_history)
+            mlflow.set_tag("requested_precision", self.precision)
+            mlflow.set_tag("initial_precision", initial_precision)
+            mlflow.set_tag("precision_fallback", "false")
 
-            self._save_model(final_dir, trainer, tokenizer, model_path, max_length)
+            for attempt_index, precision in enumerate(attempts):
+                attempt_dir = self._attempt_directory(final_dir, precision)
+                shutil.rmtree(attempt_dir, ignore_errors=True)
+                try:
+                    trainer, model = self._run_training_attempt(
+                        self.best_params,
+                        model_path,
+                        tokenizer,
+                        train_ds,
+                        val_ds,
+                        class_weights,
+                        max_length,
+                        precision,
+                        attempt_dir,
+                        final=True,
+                        logging_dir=logging_dir,
+                    )
+                    val_res = trainer.predict(val_ds)
+                    self._require_finite_array(
+                        val_res.predictions, "evaluation", "validation_logits", precision
+                    )
+                    self.best_threshold = self._optimize_threshold(val_res)
 
-        return metrics_df, model, test_ds
+                    test_res = trainer.predict(test_ds)
+                    self._require_finite_array(
+                        test_res.predictions, "evaluation", "test_logits", precision
+                    )
+                    metrics_df = self._build_metrics_df(
+                        val_res.label_ids,
+                        self._get_probs(val_res.predictions),
+                        test_res.label_ids,
+                        self._get_probs(test_res.predictions),
+                        self.best_threshold,
+                    )
+                except NonFiniteTrainingError as error:
+                    error.add_context(precision=precision)
+                    shutil.rmtree(attempt_dir, ignore_errors=True)
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    if attempt_index + 1 < len(attempts):
+                        mlflow.set_tag("precision_fallback", "true")
+                        mlflow.set_tag("mixed_failure_reason", str(error))
+                        continue
+                    mlflow.set_tag("nonfinite_failure_reason", str(error))
+                    raise
+                finally:
+                    self._active_precision = None
+
+                self.best_precision = precision
+                self.best_precision_fallback = attempt_index > 0 or self.best_precision_fallback
+                mlflow.set_tag("effective_precision", precision)
+                mlflow.set_tag(
+                    "precision_fallback", str(self.best_precision_fallback).lower()
+                )
+                self._log_final_metrics(metrics_df)
+                self._log_loss_curve(trainer.state.log_history)
+                self._save_model(final_dir, trainer, tokenizer, model_path, max_length)
+                shutil.rmtree(attempt_dir, ignore_errors=True)
+                return metrics_df, model, test_ds
+
+        raise AssertionError("Precision attempt loop exited without a result.")
 
     def _log_final_metrics(self, metrics_df):
         """Logs every numeric validation/test result as a canonical MLflow metric."""
@@ -835,6 +1132,12 @@ class BERTuneClassifier:
         Multiclass   → softmax over classes             shape (N, num_classes)
         Multi-label  → sigmoid                          shape (N, num_labels)
         """
+        self._require_finite_array(
+            predictions,
+            "evaluation",
+            "logits",
+            self._active_precision,
+        )
         if self.is_multilabel:
             return torch.sigmoid(torch.from_numpy(predictions)).numpy()
         probs = F.softmax(torch.from_numpy(predictions), dim=-1).numpy()
@@ -1032,6 +1335,9 @@ class BERTuneClassifier:
                 "is_multilabel": self.is_multilabel,
                 "target_cols": self.target_cols,
                 "max_length": max_length if max_length is not None else self.max_length,
+                "requested_precision": self.precision,
+                "effective_precision": self.best_precision,
+                "precision_fallback": self.best_precision_fallback,
             },
             "parameters": self.best_params,
         }

@@ -41,6 +41,9 @@ classifier = BERTuneClassifier(
     text_feature="text_col",           # column containing the text
     target_cols=["label_col"],         # one column = single-label
     max_length=512,
+    precision="auto",                  # BF16/FP16 on supported CUDA, else FP32
+    retry_nonfinite_in_fp32=True,       # retry verified NaN/Inf failures once
+    max_grad_norm=1.0,                  # explicit gradient clipping threshold
 )
 
 # 2. Configure (optional: uses defaults if called without arguments)
@@ -64,6 +67,12 @@ print(metrics)
 Multi-label classification: pass several target columns — `target_cols=["l1", "l2", "l3"]`. The loss switches to BCE-with-logits and one decision threshold is optimised per label.
 
 Grouped data (e.g. multiple notes per patient): pass `group_key="patient_id"` and the train/val/test split guarantees no group leaks across splits.
+
+### Numerical-stability recovery
+
+Every attempt checks logits, loss, gradients before the optimizer step, and evaluation predictions for NaN/Inf. When a mixed-precision attempt becomes non-finite, BERTuner deletes its checkpoints, reloads the pretrained model, resets the seed, and retries the same Optuna trial and hyperparameters once in FP32. A second numerical failure prunes an optimization trial; final-model training raises `NonFiniteTrainingError`. Invalid labels, class weights, OOM errors, and other exceptions never trigger the retry.
+
+`precision` accepts `"auto"`, `"fp32"`, `"bf16"`, or `"fp16"`. Explicit unsupported precision raises before training. Set `retry_nonfinite_in_fp32=False` to disable recovery, `max_grad_norm=None` to disable clipping, or `class_weight_warning_threshold=None` to disable warnings for large finite class weights. Saved `bertuner_config.json` records requested/effective precision and fallback status.
 
 ### Metrics logged to MLflow
 

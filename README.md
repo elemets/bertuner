@@ -65,6 +65,18 @@ Multi-label classification: pass several target columns — `target_cols=["l1", 
 
 Grouped data (e.g. multiple notes per patient): pass `group_key="patient_id"` and the train/val/test split guarantees no group leaks across splits.
 
+### Metrics logged to MLflow
+
+Final runs log one canonical metric set for both `Validation_*` and `Test_*`:
+
+- **Binary:** accuracy, balanced accuracy, precision, recall, specificity, F1, Matthews correlation coefficient (MCC), average precision, AUROC, Brier score, and log loss.
+- **Multiclass:** accuracy, balanced accuracy, macro and weighted precision/recall/F1, MCC, macro and weighted average precision/AUROC, and log loss.
+- **Multi-label:** subset accuracy, Hamming loss/accuracy, micro/macro/sample precision/recall/F1 and Jaccard, micro MCC, micro/macro average precision and AUROC, Brier score, and log loss.
+
+The optimized binary or per-label decision threshold is logged as a parameter. Multiclass runs log `decision_rule=argmax`. Training-time `eval_*` metrics are not duplicated in MLflow; their losses remain visible in the `plots/training_vs_evaluation_loss.png` artifact.
+
+When optimizing a lower-is-better metric such as `log_loss`, pass `greater_is_better=False`; Optuna and best-checkpoint selection will both minimize it.
+
 ## Customizing the hyperparameter search
 
 Two things are configurable: **which models** are searched and **which hyperparameters** with what ranges.

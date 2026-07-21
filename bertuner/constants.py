@@ -6,8 +6,6 @@ DEFAULT_MODEL_CHOICES = {
     "bert-base": "bert-base-uncased",
     "electra-small": "google/electra-small-discriminator",
     "electra-base": "google/electra-base-discriminator",
-    "modernbert-base": "answerdotai/ModernBERT-base",
-    "modernbert-large": "answerdotai/ModernBERT-large",
 }
 
 # Dropout attribute names per architecture (config.model_type).

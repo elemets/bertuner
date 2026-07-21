@@ -1,5 +1,6 @@
 """Unit tests for BERTuneClassifier — construction, metrics, thresholds, saving."""
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
@@ -7,6 +8,8 @@ import numpy as np
 import pandas as pd
 import pytest
 import optuna
+import mlflow
+from mlflow.tracking import MlflowClient
 
 from bertuner.BERTuner import BERTuneClassifier
 from bertuner.constants import (
@@ -109,8 +112,12 @@ class TestComputeMetrics:
         logits = np.array([[5.0, -5.0], [-5.0, 5.0], [5.0, -5.0], [-5.0, 5.0]])
         m = clf._compute_metrics((logits, labels))
         assert m["accuracy"] == 1.0
+        assert m["balanced_accuracy"] == 1.0
         assert m["f1"] == 1.0
+        assert m["mcc"] == 1.0
         assert m["auc_roc"] == 1.0
+        assert m["brier_score"] < 0.001
+        assert m["log_loss"] < 0.001
 
     def test_multilabel_perfect_predictions(self, tmp_path):
         cols = ["l1", "l2"]
@@ -122,6 +129,10 @@ class TestComputeMetrics:
         m = clf._compute_metrics((logits, labels))
         assert m["f1_micro"] == 1.0
         assert m["f1_macro"] == 1.0
+        assert m["hamming_loss"] == 0.0
+        assert m["jaccard_samples"] == 0.75
+        assert m["mcc_micro"] == 1.0
+        assert m["avg_precision_micro"] == 1.0
         assert m["auc_roc"] == 1.0
 
 
@@ -240,6 +251,35 @@ class TestSuggestHyperparams:
         assert isinstance(params["early_stopping_patience"], int)
         assert 3 <= params["early_stopping_patience"] <= 8
 
+    def test_optimize_uses_minimize_for_lower_is_better_metric(
+        self, tmp_path, monkeypatch
+    ):
+        clf = make_classifier(tmp_path)
+        client = MagicMock()
+        client.get_experiment_by_name.return_value = SimpleNamespace(
+            lifecycle_stage="active"
+        )
+        study = MagicMock(
+            best_params={"model": "bert-base"},
+            best_value=0.1,
+            best_trial=SimpleNamespace(number=0),
+        )
+        create_study = MagicMock(return_value=study)
+
+        monkeypatch.setattr("bertuner.BERTuner.MlflowClient", lambda: client)
+        monkeypatch.setattr("bertuner.BERTuner.mlflow.set_tracking_uri", MagicMock())
+        monkeypatch.setattr("bertuner.BERTuner.mlflow.set_experiment", MagicMock())
+        monkeypatch.setattr("bertuner.BERTuner.optuna.create_study", create_study)
+
+        clf.optimize(
+            n_trials=2,
+            optimize_metric="log_loss",
+            greater_is_better=False,
+        )
+
+        assert create_study.call_args.kwargs["direction"] == "minimize"
+        study.optimize.assert_called_once_with(clf._objective, n_trials=2)
+
 
 # ------------------------------------------------------------------
 # Metrics DataFrame
@@ -254,6 +294,11 @@ class TestBuildMetricsDf:
         df = clf._build_metrics_df(y, p, y, p, thresh=0.5)
         assert list(df["Split"]) == ["Validation", "Test"]
         assert df.iloc[0]["F1"] == 1.0
+        assert df.iloc[0]["Balanced_Accuracy"] == 1.0
+        assert df.iloc[0]["MCC"] == 1.0
+        assert df.iloc[0]["Average_Precision"] == 1.0
+        assert df.iloc[0]["AUROC"] == 1.0
+        assert df.iloc[0]["Brier_Score"] < 0.05
         assert df.iloc[0]["Threshold"] == 0.5
 
     def test_multilabel_uses_array_threshold(self, tmp_path):
@@ -266,28 +311,39 @@ class TestBuildMetricsDf:
         df = clf._build_metrics_df(y, p, y, p, thresh=np.array([0.5, 0.5]))
         assert df.iloc[0]["F1"] == 1.0
         assert "F1_micro" in df.columns
+        assert df.iloc[0]["Hamming_Loss"] == 0.0
+        assert df.iloc[0]["Average_Precision_macro"] == 1.0
+        assert df.iloc[0]["AUROC_micro"] == 1.0
 
 
 class TestLossCurveLogging:
     def test_logs_average_precision_and_auroc(self, tmp_path, monkeypatch):
         clf = make_classifier(tmp_path)
         logged = MagicMock()
+        logged_param = MagicMock()
         monkeypatch.setattr("bertuner.BERTuner.mlflow.log_metric", logged)
+        monkeypatch.setattr("bertuner.BERTuner.mlflow.log_param", logged_param)
         metrics = pd.DataFrame(
             [
                 {
                     "Split": "Validation",
                     "Accuracy": 0.7,
+                    "Balanced_Accuracy": 0.68,
+                    "Precision": 0.72,
                     "F1": 0.6,
-                    "AP": 0.8,
-                    "AUC": 0.9,
+                    "Average_Precision": 0.8,
+                    "AUROC": 0.9,
+                    "Threshold": 0.42,
                 },
                 {
                     "Split": "Test",
                     "Accuracy": 0.65,
+                    "Balanced_Accuracy": 0.63,
+                    "Precision": 0.67,
                     "F1": 0.55,
-                    "AP": 0.75,
-                    "AUC": 0.85,
+                    "Average_Precision": 0.75,
+                    "AUROC": 0.85,
+                    "Threshold": 0.42,
                 },
             ]
         )
@@ -299,6 +355,9 @@ class TestLossCurveLogging:
         assert calls["Validation_AUROC"] == 0.9
         assert calls["Test_Average_Precision"] == 0.75
         assert calls["Test_AUROC"] == 0.85
+        assert calls["Validation_Balanced_Accuracy"] == 0.68
+        assert calls["Test_Precision"] == 0.67
+        logged_param.assert_called_once_with("decision_threshold", 0.42)
 
     def test_logs_training_and_eval_loss_figure(self, tmp_path, monkeypatch):
         clf = make_classifier(tmp_path)
@@ -316,6 +375,36 @@ class TestLossCurveLogging:
 
         logged.assert_called_once()
         assert logged.call_args.args[1] == "plots/training_vs_evaluation_loss.png"
+
+    def test_loss_figure_is_stored_as_mlflow_artifact(self, tmp_path):
+        clf = make_classifier(tmp_path)
+        previous_uri = mlflow.get_tracking_uri()
+        tracking_uri = (tmp_path / "artifact-test-mlruns").as_uri()
+        artifact_location = (tmp_path / "artifact-test-files").as_uri()
+
+        try:
+            mlflow.set_tracking_uri(tracking_uri)
+            experiment_id = mlflow.create_experiment(
+                "loss-curve-artifact-test",
+                artifact_location=artifact_location,
+            )
+            with mlflow.start_run(experiment_id=experiment_id) as run:
+                clf._log_loss_curve(
+                    [
+                        {"loss": 0.8, "epoch": 1.0},
+                        {"eval_loss": 0.9, "epoch": 1.0},
+                    ]
+                )
+
+            artifact_path = MlflowClient().download_artifacts(
+                run.info.run_id,
+                "plots/training_vs_evaluation_loss.png",
+                str(tmp_path / "downloaded-artifacts"),
+            )
+            assert Path(artifact_path).is_file()
+        finally:
+            mlflow.end_run()
+            mlflow.set_tracking_uri(previous_uri)
 
     def test_skips_figure_when_either_loss_series_is_missing(
         self, tmp_path, monkeypatch
@@ -511,8 +600,13 @@ class TestMulticlass:
         labels = np.array([0, 1, 2, 0])
         metrics = clf._compute_metrics((logits, labels))
         assert metrics["accuracy"] == 1.0
+        assert metrics["balanced_accuracy"] == 1.0
         assert metrics["f1"] == 1.0
+        assert metrics["f1_weighted"] == 1.0
+        assert metrics["mcc"] == 1.0
         assert metrics["auc_roc"] == 1.0
+        assert metrics["auc_roc_weighted"] == 1.0
+        assert metrics["log_loss"] < 0.1
         assert "specificity" not in metrics
 
     def test_compute_metrics_missing_class_falls_back(self, tmp_path):
@@ -544,7 +638,12 @@ class TestMulticlass:
         )
         df = clf._build_metrics_df(y, p, y, p, thresh=None)
         assert df.iloc[0]["Accuracy"] == 1.0
+        assert df.iloc[0]["Balanced_Accuracy"] == 1.0
         assert df.iloc[0]["F1"] == 1.0
+        assert df.iloc[0]["F1_weighted"] == 1.0
+        assert df.iloc[0]["MCC"] == 1.0
+        assert df.iloc[0]["Average_Precision_macro"] == 1.0
+        assert df.iloc[0]["AUROC_weighted"] == 1.0
         assert df.iloc[0]["Threshold"] is None
 
 

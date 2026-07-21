@@ -20,12 +20,18 @@ from transformers import (
     set_seed,
 )
 from sklearn.metrics import (
+    accuracy_score,
+    average_precision_score,
+    balanced_accuracy_score,
+    brier_score_loss,
+    f1_score,
+    hamming_loss,
+    jaccard_score,
+    log_loss,
+    matthews_corrcoef,
     precision_score,
     recall_score,
-    f1_score,
-    average_precision_score,
     roc_auc_score,
-    accuracy_score,
 )
 from sklearn.preprocessing import label_binarize
 from mlflow.tracking import MlflowClient
@@ -213,8 +219,12 @@ class BERTuneClassifier:
         """
         Computes metrics for both single-label and multi-label modes.
 
-        Single-label: accuracy, f1, precision, recall, specificity, AP, AUC-ROC
-        Multi-label:  micro/macro/sample-averaged variants of the above
+        Binary: accuracy, balanced accuracy, precision/recall/specificity, F1,
+                MCC, average precision, AUROC, Brier score, and log loss.
+        Multiclass: macro and weighted classification metrics plus MCC,
+                    one-vs-rest ranking metrics, and log loss.
+        Multi-label: micro/macro/sample classification metrics, Hamming and
+                     Jaccard scores, ranking metrics, MCC, Brier score, and log loss.
         """
         predictions, labels = eval_pred
 
@@ -226,29 +236,46 @@ class BERTuneClassifier:
 
             metrics = {
                 "accuracy": accuracy_score(labels, preds),
+                "hamming_loss": hamming_loss(labels, preds),
+                "hamming_accuracy": 1.0 - hamming_loss(labels, preds),
                 "precision_micro": precision_score(
                     labels, preds, average="micro", zero_division=0
                 ),
+                "precision_macro": precision_score(
+                    labels, preds, average="macro", zero_division=0
+                ),
+                "precision_samples": precision_score(
+                    labels, preds, average="samples", zero_division=0
+                ),
                 "recall_micro": recall_score(labels, preds, average="micro", zero_division=0),
+                "recall_macro": recall_score(labels, preds, average="macro", zero_division=0),
+                "recall_samples": recall_score(
+                    labels, preds, average="samples", zero_division=0
+                ),
                 "f1_micro": f1_score(labels, preds, average="micro", zero_division=0),
                 "f1_macro": f1_score(labels, preds, average="macro", zero_division=0),
                 "f1_samples": f1_score(labels, preds, average="samples", zero_division=0),
+                "jaccard_micro": jaccard_score(
+                    labels, preds, average="micro", zero_division=0
+                ),
+                "jaccard_macro": jaccard_score(
+                    labels, preds, average="macro", zero_division=0
+                ),
+                "jaccard_samples": jaccard_score(
+                    labels, preds, average="samples", zero_division=0
+                ),
+                "mcc_micro": matthews_corrcoef(labels.ravel(), preds.ravel()),
+                "brier_score_micro": brier_score_loss(labels.ravel(), probs.ravel()),
+                "log_loss_micro": log_loss(
+                    labels.ravel(), probs.ravel(), labels=[0, 1]
+                ),
             }
-            # Average-precision and AUC per label, then macro-average
-
-            aps = []
-            aucs = []
-
-            for i in range(labels.shape[1]):
-                y_i = labels[:, i]
-                p_i = probs[:, i]
-
-                if len(np.unique(y_i)) > 1:
-                    aps.append(average_precision_score(y_i, p_i))
-                    aucs.append(roc_auc_score(y_i, p_i))
-
-            metrics["avg_precision"] = float(np.mean(aps)) if aps else 0.5
-            metrics["auc_roc"] = float(np.mean(aucs)) if aucs else 0.5
+            ranking = self._multilabel_ranking_metrics(labels, probs)
+            # Preserve the original names for optimization compatibility.
+            metrics["avg_precision"] = ranking["average_precision_macro"]
+            metrics["avg_precision_micro"] = ranking["average_precision_micro"]
+            metrics["auc_roc"] = ranking["auroc_macro"]
+            metrics["auc_roc_micro"] = ranking["auroc_micro"]
         else:
             # Single-label: predictions shape (N, num_classes) or (N,)
             if len(predictions.shape) > 1:
@@ -261,23 +288,47 @@ class BERTuneClassifier:
             if self.is_binary:
                 metrics = {
                     "accuracy": accuracy_score(labels, preds),
+                    "balanced_accuracy": balanced_accuracy_score(labels, preds),
                     "precision": precision_score(labels, preds, zero_division=0),
                     "recall": recall_score(labels, preds, zero_division=0),
                     "f1": f1_score(labels, preds, zero_division=0),
                     "specificity": recall_score(labels, preds, pos_label=0, zero_division=0),
+                    "mcc": matthews_corrcoef(labels, preds),
                 }
                 if probs is not None:
-                    metrics["avg_precision"] = average_precision_score(labels, probs[:, 1])
+                    positive_probs = probs[:, 1]
+                    metrics["avg_precision"] = average_precision_score(
+                        labels, positive_probs
+                    )
                     metrics["auc_roc"] = (
-                        roc_auc_score(labels, probs[:, 1]) if len(np.unique(labels)) > 1 else 0.5
+                        roc_auc_score(labels, positive_probs)
+                        if len(np.unique(labels)) > 1
+                        else 0.5
+                    )
+                    metrics["brier_score"] = brier_score_loss(
+                        labels, positive_probs
+                    )
+                    metrics["log_loss"] = log_loss(
+                        labels, positive_probs, labels=[0, 1]
                     )
             else:
                 # Multiclass: macro-averaged metrics, one-vs-rest ranking metrics
                 metrics = {
                     "accuracy": accuracy_score(labels, preds),
+                    "balanced_accuracy": balanced_accuracy_score(labels, preds),
                     "precision": precision_score(labels, preds, average="macro", zero_division=0),
+                    "precision_weighted": precision_score(
+                        labels, preds, average="weighted", zero_division=0
+                    ),
                     "recall": recall_score(labels, preds, average="macro", zero_division=0),
+                    "recall_weighted": recall_score(
+                        labels, preds, average="weighted", zero_division=0
+                    ),
                     "f1": f1_score(labels, preds, average="macro", zero_division=0),
+                    "f1_weighted": f1_score(
+                        labels, preds, average="weighted", zero_division=0
+                    ),
+                    "mcc": matthews_corrcoef(labels, preds),
                 }
                 # Ranking metrics need every class present in the eval split
                 if probs is not None and len(np.unique(labels)) == probs.shape[1]:
@@ -285,14 +336,66 @@ class BERTuneClassifier:
                     metrics["avg_precision"] = average_precision_score(
                         y_bin, probs, average="macro"
                     )
+                    metrics["avg_precision_weighted"] = average_precision_score(
+                        y_bin, probs, average="weighted"
+                    )
                     metrics["auc_roc"] = roc_auc_score(
                         labels, probs, multi_class="ovr", average="macro"
                     )
+                    metrics["auc_roc_weighted"] = roc_auc_score(
+                        labels, probs, multi_class="ovr", average="weighted"
+                    )
                 elif probs is not None:
                     metrics["avg_precision"] = 0.5
+                    metrics["avg_precision_weighted"] = 0.5
                     metrics["auc_roc"] = 0.5
+                    metrics["auc_roc_weighted"] = 0.5
+                if probs is not None:
+                    metrics["log_loss"] = log_loss(
+                        labels,
+                        probs,
+                        labels=np.arange(probs.shape[1]),
+                    )
 
         return metrics
+
+    @staticmethod
+    def _multilabel_ranking_metrics(labels, probs):
+        """Returns robust macro/micro AP and AUROC for multi-label targets."""
+        valid_columns = [
+            i for i in range(labels.shape[1]) if len(np.unique(labels[:, i])) > 1
+        ]
+        if valid_columns:
+            aps = [
+                average_precision_score(labels[:, i], probs[:, i])
+                for i in valid_columns
+            ]
+            aucs = [
+                roc_auc_score(labels[:, i], probs[:, i]) for i in valid_columns
+            ]
+            average_precision_macro = float(np.mean(aps))
+            auroc_macro = float(np.mean(aucs))
+        else:
+            average_precision_macro = 0.5
+            auroc_macro = 0.5
+
+        flat_labels = labels.ravel()
+        flat_probs = probs.ravel()
+        if len(np.unique(flat_labels)) > 1:
+            average_precision_micro = average_precision_score(
+                flat_labels, flat_probs
+            )
+            auroc_micro = roc_auc_score(flat_labels, flat_probs)
+        else:
+            average_precision_micro = 0.5
+            auroc_micro = 0.5
+
+        return {
+            "average_precision_macro": average_precision_macro,
+            "average_precision_micro": float(average_precision_micro),
+            "auroc_macro": auroc_macro,
+            "auroc_micro": float(auroc_micro),
+        }
 
     # ------------------------------------------------------------------
     # Data preparation
@@ -561,7 +664,12 @@ class BERTuneClassifier:
         mlflow.set_experiment(experiment_name=exp_name)
 
         sampler = TPESampler(seed=self.seed)
-        study = optuna.create_study(direction="maximize", study_name=study_name, sampler=sampler)
+        direction = "maximize" if greater_is_better else "minimize"
+        study = optuna.create_study(
+            direction=direction,
+            study_name=study_name,
+            sampler=sampler,
+        )
         self.optimize_metric = optimize_metric
         study.optimize(self._objective, n_trials=n_trials)
 
@@ -609,7 +717,11 @@ class BERTuneClassifier:
             save_total_limit=2,
             load_best_model_at_end=True,
             logging_strategy="epoch",
-            report_to=["tensorboard", "mlflow"],
+            # The final validation/test metrics are logged explicitly below.
+            # Sending Trainer logs to MLflow as well creates a second, misleading
+            # eval_* metric set from the last epoch rather than the restored best
+            # checkpoint.
+            report_to=["tensorboard"],
             logging_dir=f"{final_dir}/logs",
             seed=self.seed,
             **self._precision_flags(),
@@ -656,18 +768,23 @@ class BERTuneClassifier:
         return metrics_df, model, test_ds
 
     def _log_final_metrics(self, metrics_df):
-        """Logs the final validation and test metrics with descriptive names."""
-        metric_names = {
-            "Accuracy": "Accuracy",
-            "F1": "F1",
-            "AP": "Average_Precision",
-            "AUC": "AUROC",
-        }
+        """Logs every numeric validation/test result as a canonical MLflow metric."""
         for _, row in metrics_df.iterrows():
-            for column, metric_name in metric_names.items():
-                mlflow.log_metric(
-                    f"{row['Split']}_{metric_name}", float(row[column])
-                )
+            for column, value in row.items():
+                if column in {"Split", "Threshold"}:
+                    continue
+                if isinstance(value, (int, float, np.integer, np.floating)) and np.isfinite(
+                    value
+                ):
+                    mlflow.log_metric(f"{row['Split']}_{column}", float(value))
+
+        threshold = metrics_df.iloc[0].get("Threshold")
+        if threshold is None or (
+            isinstance(threshold, (float, np.floating)) and np.isnan(threshold)
+        ):
+            mlflow.log_param("decision_rule", "argmax")
+        else:
+            mlflow.log_param("decision_threshold", threshold)
 
     def _log_loss_curve(self, log_history):
         """Logs an epoch-level training-vs-evaluation loss plot to MLflow."""
@@ -776,18 +893,42 @@ class BERTuneClassifier:
             if self.is_multilabel:
                 # thresh is shape (num_labels,); p is (N, num_labels)
                 preds = (p >= thresh).astype(int)
+                ranking = self._multilabel_ranking_metrics(y, p)
+                current_hamming_loss = hamming_loss(y, preds)
                 return {
                     "Split": split,
                     "Accuracy": accuracy_score(y, preds),
+                    "Hamming_Loss": current_hamming_loss,
+                    "Hamming_Accuracy": 1.0 - current_hamming_loss,
                     "Precision_micro": precision_score(y, preds, average="micro", zero_division=0),
+                    "Precision_macro": precision_score(y, preds, average="macro", zero_division=0),
+                    "Precision_samples": precision_score(
+                        y, preds, average="samples", zero_division=0
+                    ),
                     "Recall_micro": recall_score(y, preds, average="micro", zero_division=0),
+                    "Recall_macro": recall_score(y, preds, average="macro", zero_division=0),
+                    "Recall_samples": recall_score(
+                        y, preds, average="samples", zero_division=0
+                    ),
                     "F1": f1_score(y, preds, average="macro", zero_division=0),
                     "F1_micro": f1_score(y, preds, average="micro", zero_division=0),
                     "F1_samples": f1_score(y, preds, average="samples", zero_division=0),
-                    "AP": average_precision_score(y, p, average="macro"),
-                    "AUC": (
-                        roc_auc_score(y, p, average="macro") if len(np.unique(y)) > 1 else 0.5
+                    "Jaccard_micro": jaccard_score(
+                        y, preds, average="micro", zero_division=0
                     ),
+                    "Jaccard_macro": jaccard_score(
+                        y, preds, average="macro", zero_division=0
+                    ),
+                    "Jaccard_samples": jaccard_score(
+                        y, preds, average="samples", zero_division=0
+                    ),
+                    "MCC_micro": matthews_corrcoef(y.ravel(), preds.ravel()),
+                    "Average_Precision_macro": ranking["average_precision_macro"],
+                    "Average_Precision_micro": ranking["average_precision_micro"],
+                    "AUROC_macro": ranking["auroc_macro"],
+                    "AUROC_micro": ranking["auroc_micro"],
+                    "Brier_Score_micro": brier_score_loss(y.ravel(), p.ravel()),
+                    "Log_Loss_micro": log_loss(y.ravel(), p.ravel(), labels=[0, 1]),
                     "Threshold": str(np.round(thresh, 3).tolist()),
                 }
             elif self.is_binary:
@@ -796,12 +937,16 @@ class BERTuneClassifier:
                 return {
                     "Split": split,
                     "Accuracy": accuracy_score(y, preds),
+                    "Balanced_Accuracy": balanced_accuracy_score(y, preds),
                     "Precision": precision_score(y, preds, zero_division=0),
                     "Recall": recall_score(y, preds, zero_division=0),
                     "F1": f1_score(y, preds, zero_division=0),
                     "Specificity": recall_score(y, preds, pos_label=0, zero_division=0),
-                    "AP": average_precision_score(y, p),
-                    "AUC": roc_auc_score(y, p) if len(np.unique(y)) > 1 else 0.5,
+                    "MCC": matthews_corrcoef(y, preds),
+                    "Average_Precision": average_precision_score(y, p),
+                    "AUROC": roc_auc_score(y, p) if len(np.unique(y)) > 1 else 0.5,
+                    "Brier_Score": brier_score_loss(y, p),
+                    "Log_Loss": log_loss(y, p, labels=[0, 1]),
                     "Threshold": thresh,
                 }
             else:
@@ -811,10 +956,21 @@ class BERTuneClassifier:
                 return {
                     "Split": split,
                     "Accuracy": accuracy_score(y, preds),
+                    "Balanced_Accuracy": balanced_accuracy_score(y, preds),
                     "Precision": precision_score(y, preds, average="macro", zero_division=0),
+                    "Precision_weighted": precision_score(
+                        y, preds, average="weighted", zero_division=0
+                    ),
                     "Recall": recall_score(y, preds, average="macro", zero_division=0),
+                    "Recall_weighted": recall_score(
+                        y, preds, average="weighted", zero_division=0
+                    ),
                     "F1": f1_score(y, preds, average="macro", zero_division=0),
-                    "AP": (
+                    "F1_weighted": f1_score(
+                        y, preds, average="weighted", zero_division=0
+                    ),
+                    "MCC": matthews_corrcoef(y, preds),
+                    "Average_Precision_macro": (
                         average_precision_score(
                             label_binarize(y, classes=np.arange(p.shape[1])),
                             p,
@@ -823,10 +979,27 @@ class BERTuneClassifier:
                         if all_classes_present
                         else 0.5
                     ),
-                    "AUC": (
+                    "Average_Precision_weighted": (
+                        average_precision_score(
+                            label_binarize(y, classes=np.arange(p.shape[1])),
+                            p,
+                            average="weighted",
+                        )
+                        if all_classes_present
+                        else 0.5
+                    ),
+                    "AUROC_macro": (
                         roc_auc_score(y, p, multi_class="ovr", average="macro")
                         if all_classes_present
                         else 0.5
+                    ),
+                    "AUROC_weighted": (
+                        roc_auc_score(y, p, multi_class="ovr", average="weighted")
+                        if all_classes_present
+                        else 0.5
+                    ),
+                    "Log_Loss": log_loss(
+                        y, p, labels=np.arange(p.shape[1])
                     ),
                     "Threshold": None,
                 }

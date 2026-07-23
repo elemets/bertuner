@@ -112,6 +112,17 @@ class BERTuneClassifier:
         self.target_cols = target_cols
         self.seed = seed
         self.df = pd.read_csv(data_path) if data_path is not None else dataframe.copy()
+        # Missing/NaN text values are coerced to empty strings so tokenization
+        # does not error on non-string inputs. Warn so callers know rows were
+        # altered rather than dropped.
+        n_missing = int(self.df[text_feature].isna().sum())
+        if n_missing:
+            warnings.warn(
+                f"{n_missing} missing (NaN) value(s) in text column "
+                f"'{text_feature}' were replaced with empty strings.",
+                stacklevel=2,
+            )
+        self.df[text_feature] = self.df[text_feature].fillna("").astype(str)
         if num_labels is not None:
             self.num_labels = num_labels
         elif self.is_multilabel:

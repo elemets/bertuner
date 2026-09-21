@@ -87,11 +87,10 @@ class BERTuneClassifier:
         retry_nonfinite_in_fp32: bool = True,
         max_grad_norm: float | None = 1.0,
         class_weight_warning_threshold: float | None = 100.0,
+        data_splits: dict[str, pd.DataFrame | str | os.PathLike] = None,
     ):
-        if data_path is None and dataframe is None:
-            raise ValueError("Provide either data_path (CSV) or dataframe, not neither.")
-        if data_path is not None and dataframe is not None:
-            raise ValueError("Provide either data_path (CSV) or dataframe, not both.")
+        if sum(source is not None for source in (data_path, dataframe, data_splits)) != 1:
+            raise ValueError("Provide exactly one of data_path (CSV), dataframe, or data_splits.")
         if precision not in {"auto", "fp32", "bf16", "fp16"}:
             raise ValueError("precision must be one of: 'auto', 'fp32', 'bf16', 'fp16'.")
         if max_grad_norm is not None and (
@@ -111,7 +110,12 @@ class BERTuneClassifier:
         self.text_feature = text_feature
         self.target_cols = target_cols
         self.seed = seed
-        self.df = pd.read_csv(data_path) if data_path is not None else dataframe.copy()
+        self._data_splits = None
+        if data_splits is not None:
+            self._data_splits = self._load_data_splits(data_splits, group_key)
+            self.df = pd.concat(self._data_splits.values(), ignore_index=True)
+        else:
+            self.df = pd.read_csv(data_path) if data_path is not None else dataframe.copy()
         # Missing/NaN text values are coerced to empty strings so tokenization
         # does not error on non-string inputs. Warn so callers know rows were
         # altered rather than dropped.
@@ -123,6 +127,9 @@ class BERTuneClassifier:
                 stacklevel=2,
             )
         self.df[text_feature] = self.df[text_feature].fillna("").astype(str)
+        if self._data_splits is not None:
+            for frame in self._data_splits.values():
+                frame[text_feature] = frame[text_feature].fillna("").astype(str)
         if num_labels is not None:
             self.num_labels = num_labels
         elif self.is_multilabel:
@@ -163,7 +170,7 @@ class BERTuneClassifier:
         else:
             print(f"Logging mlflow runs locally to: {self.mlflow_uri} (no server needed)")
 
-        if self.is_multilabel and self.group_key:
+        if self.is_multilabel and self.group_key and self._data_splits is None:
             print(
                 "[WARNING] group_key is set but multi-label mode is active. "
                 "StratifiedGroupKFold does not support multi-label targets — "
@@ -473,12 +480,51 @@ class BERTuneClassifier:
     # Data preparation
     # ------------------------------------------------------------------
 
+    def _load_data_splits(self, data_splits, group_key):
+        """Copy external partitions, validating their schema and group isolation."""
+        if not isinstance(data_splits, dict):
+            raise ValueError("data_splits must be a dict with train, validation, and test keys.")
+        sources = dict(data_splits)
+        if "val" in sources and "validation" not in sources:
+            sources["validation"] = sources.pop("val")
+        if set(sources) != {"train", "validation", "test"}:
+            raise ValueError("data_splits requires exactly train, validation (or val), and test.")
+        required = [self.text_feature, *self.target_cols]
+        if group_key is not None:
+            required.append(group_key)
+        frames = {}
+        for name in ("train", "validation", "test"):
+            source = sources[name]
+            if isinstance(source, pd.DataFrame):
+                frame = source.copy()
+            elif isinstance(source, (str, os.PathLike)):
+                frame = pd.read_csv(source)
+            else:
+                raise ValueError(f"data_splits['{name}'] must be a DataFrame or CSV path.")
+            missing = [col for col in required if col not in frame.columns]
+            if missing:
+                raise ValueError(f"Split '{name}' is missing required columns: {missing}")
+            if frame.empty:
+                raise ValueError(f"Split '{name}' must not be empty.")
+            frames[name] = frame
+        if group_key is not None:
+            seen = set()
+            for name, frame in frames.items():
+                if frame[group_key].isna().any():
+                    raise ValueError(f"Split '{name}' contains missing group IDs in '{group_key}'.")
+                groups = set(frame[group_key].astype(str).str.strip().str.casefold())
+                if seen & groups:
+                    raise ValueError(f"Group leakage detected in supplied splits for '{group_key}'.")
+                seen.update(groups)
+        return frames
+
     def _prepare_datasets(self, tokenizer, group_key, max_length=512):
         """
         Splits, balances, and tokenizes data.
 
         Splitting strategy
         ------------------
+        data_splits supplied    → preserve external partitions and row order
         Multi-label + group_key  → standard split (group stratification not supported
                                    for multi-label targets; warning shown in __init__)
         Single-label + group_key → StratifiedGroupKFold split
@@ -489,7 +535,11 @@ class BERTuneClassifier:
             not self.is_multilabel and group_key is not None and group_key in self.df.columns
         )
 
-        if use_group_split:
+        if self._data_splits is not None:
+            train, val, test = (
+                self._data_splits[name] for name in ("train", "validation", "test")
+            )
+        elif use_group_split:
             self.df[group_key] = self.df[group_key].astype(str).str.strip().str.casefold()
             train, val, test = split_group_stratified(
                 self.df,

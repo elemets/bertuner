@@ -68,6 +68,27 @@ Multi-label classification: pass several target columns — `target_cols=["l1", 
 
 Grouped data (e.g. multiple notes per patient): pass `group_key="patient_id"` and the train/val/test split guarantees no group leaks across splits.
 
+### Using existing splits
+
+Supply `data_splits` instead of `data_path` or `dataframe` to reuse your own partitions:
+
+```python
+classifier = BERTuneClassifier(
+    models_dir="../models/",
+    text_feature="text_col",
+    target_cols=["label_col"],
+    data_splits={
+        "train": train_df,
+        "validation": validation_df,  # "val" also accepted
+        "test": test_df,
+    },
+)
+```
+
+Each value can also be a CSV path, such as `"data/train.csv"` (including `pathlib.Path` objects). All three splits must be nonempty and contain the text and target columns. Use the same numeric label encoding across all splits. Both optimization and final training preserve these partitions and their row order; no random splitting or stratification is performed. Class weights are calculated from training data, and threshold selection uses validation data.
+
+If you supply `group_key`, each split must contain that column with nonmissing IDs. Overlapping groups across splits raise an error, including in multi-label mode. Group comparisons ignore surrounding whitespace and case. Without `group_key`, checking for overlap between external partitions is the caller's responsibility; DataFrame indices are not treated as row IDs.
+
 ### Numerical-stability recovery
 
 Every attempt checks logits, loss, gradients before the optimizer step, and evaluation predictions for NaN/Inf. When a mixed-precision attempt becomes non-finite, BERTuner deletes its checkpoints, reloads the pretrained model, resets the seed, and retries the same Optuna trial and hyperparameters once in FP32. A second numerical failure prunes an optimization trial; final-model training raises `NonFiniteTrainingError`. Invalid labels, class weights, OOM errors, and other exceptions never trigger the retry.

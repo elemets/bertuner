@@ -85,6 +85,93 @@ class TestConstruction:
         assert clf.num_labels == 7
 
 
+class TestExternalSplits:
+    @staticmethod
+    def splits():
+        df = make_df(n=12)
+        return {"train": df.iloc[:6], "validation": df.iloc[6:9], "test": df.iloc[9:]}
+
+    @pytest.mark.parametrize("multilabel", [False, True])
+    @pytest.mark.parametrize("csv", [False, True])
+    def test_preserves_partitions_across_preparations(self, tmp_path, monkeypatch, multilabel, csv):
+        splits = self.splits()
+        targets = ["target"]
+        if multilabel:
+            targets.append("other")
+            splits = {name: frame.assign(other=1 - frame.target) for name, frame in splits.items()}
+        sources = splits
+        if csv:
+            sources = {}
+            for name, frame in splits.items():
+                sources[name] = tmp_path / f"{name}.csv"
+                frame.to_csv(sources[name], index=False)
+        clf = make_classifier(tmp_path, dataframe=None, data_splits=sources, target_cols=targets)
+        def no_split(*args, **kwargs):
+            pytest.fail("External partitions must never be split again")
+        monkeypatch.setattr("bertuner.BERTuner.train_val_test_split", no_split)
+        monkeypatch.setattr("bertuner.BERTuner.split_group_stratified", no_split)
+        def tokenizer(texts, **kwargs):
+            return {"input_ids": [[int(text.rsplit(" ", 1)[1])] for text in texts]}
+        for seed in (7, 99):
+            clf.seed = seed
+            datasets = clf._prepare_datasets(tokenizer, None)
+            for ds, frame in zip(datasets, splits.values()):
+                assert ds[:]["input_ids"].tolist() == [[i] for i in frame.index]
+                expected = frame[targets].values.tolist() if multilabel else frame.target.tolist()
+                assert ds[:]["labels"].tolist() == expected
+
+    def test_copies_inputs_and_cleans_text(self, tmp_path):
+        splits = self.splits()
+        splits["train"] = splits["train"].copy()
+        splits["train"].iloc[0, 0] = None
+        splits["val"] = splits.pop("validation")
+        with pytest.warns(UserWarning, match="missing"):
+            clf = make_classifier(tmp_path, dataframe=None, data_splits=splits)
+        assert clf._data_splits["train"].iloc[0, 0] == ""
+        assert splits["train"].iloc[0, 0] is None
+        splits["train"].iloc[1, 0] = "changed"
+        assert clf._data_splits["train"].iloc[1, 0] == "sample text 1"
+
+    @pytest.mark.parametrize("problem,match", [
+        ("missing_split", "requires exactly"),
+        ("extra_split", "requires exactly"),
+        ("empty", "must not be empty"),
+        ("column", "missing required columns"),
+        ("type", "DataFrame or CSV path"),
+    ])
+    def test_invalid_splits(self, tmp_path, problem, match):
+        splits = self.splits()
+        if problem == "missing_split":
+            splits.pop("test")
+        elif problem == "extra_split":
+            splits["val"] = splits["validation"]
+        elif problem == "empty":
+            splits["test"] = splits["test"].iloc[:0]
+        elif problem == "column":
+            splits["test"] = splits["test"].drop(columns="target")
+        else:
+            splits["test"] = None
+        with pytest.raises(ValueError, match=match):
+            make_classifier(tmp_path, dataframe=None, data_splits=splits)
+
+    def test_rejects_conflicting_sources(self, tmp_path):
+        with pytest.raises(ValueError, match="exactly one"):
+            make_classifier(tmp_path, data_splits=self.splits())
+
+    @pytest.mark.parametrize("multilabel", [False, True])
+    def test_group_validation(self, tmp_path, multilabel):
+        splits = {name: frame.assign(patient=name, other=1) for name, frame in self.splits().items()}
+        kwargs = dict(dataframe=None, data_splits=splits, group_key="patient",
+                      target_cols=["target", "other"] if multilabel else ["target"])
+        make_classifier(tmp_path, **kwargs)
+        splits["test"]["patient"] = " TRAIN "
+        with pytest.raises(ValueError, match="Group leakage"):
+            make_classifier(tmp_path, **kwargs)
+        splits["test"]["patient"] = None
+        with pytest.raises(ValueError, match="missing group IDs"):
+            make_classifier(tmp_path, **kwargs)
+
+
 class TestMlflowUri:
     def test_plain_path_becomes_file_uri(self, tmp_path):
         clf = make_classifier(tmp_path, mlflow_tracking_uri="./mlruns")

@@ -69,6 +69,9 @@ class CustomTrainer(Trainer):
         callbacks = list(kwargs.pop("callbacks", None) or [])
         callbacks.append(NonFiniteGradientCallback(training_precision))
         super().__init__(callbacks=callbacks, **kwargs)
+        # compute_loss returns a microbatch mean and does not consume
+        # num_items_in_batch, even when the model's forward accepts **kwargs.
+        self.model_accepts_loss_kwargs = False
         self.loss_type = loss_type
         self.class_weights = class_weights
         self.training_precision = training_precision

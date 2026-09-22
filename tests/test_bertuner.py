@@ -483,6 +483,7 @@ class TestLossCurveLogging:
                     ]
                 )
 
+            (tmp_path / "downloaded-artifacts").mkdir()
             artifact_path = MlflowClient().download_artifacts(
                 run.info.run_id,
                 "plots/training_vs_evaluation_loss.png",
@@ -785,7 +786,7 @@ class TestMulticlassWeightedLoss:
             loss = trainer._singlelabel_loss(logits, labels, torch.device("cpu"))
             assert torch.isfinite(loss)
 
-    def test_end_to_end_training_three_classes(self, tmp_path):
+    def test_end_to_end_training_three_classes(self, tmp_path, tiny_model_path):
         import torch
         from transformers import (
             AutoModelForSequenceClassification,
@@ -795,7 +796,7 @@ class TestMulticlassWeightedLoss:
         )
         from bertuner.CustomTrainer import CustomTrainer
 
-        model_path = "prajjwal1/bert-tiny"
+        model_path = tiny_model_path
         clf = make_classifier(tmp_path, dataframe=make_df(n=60, num_classes=3))
         assert clf.num_labels == 3
 

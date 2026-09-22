@@ -17,6 +17,20 @@ git clone https://github.com/elemets/bertuner && cd bertuner
 pip install -r requirements.txt
 ```
 
+BERTuner supports Transformers 4.48+ and 5.x. Compatibility tests cover the
+4.48 baseline and the latest available 4.x and 5.x releases, including final
+training, TensorBoard logging, warmup scheduling, and gradient accumulation.
+Future releases are checked by a weekly CI run rather than assumed compatible.
+
+When initializing a classifier from a base pretrained model, a Transformers 5
+load report may list `lm_head.*` weights as `UNEXPECTED` and classifier weights
+as `MISSING`. This is expected when replacing the language-model head with a
+classification head; the new head is learned during fine-tuning. Unexpected
+encoder weights or shape mismatches should still be investigated.
+
+Run the test suite with `python -m pytest tests -q`. Training regression tests
+use a tiny local checkpoint; cached-model predictor tests skip if unavailable.
+
 MLflow tracking works in two modes:
 
 ```bash

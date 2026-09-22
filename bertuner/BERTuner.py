@@ -15,7 +15,6 @@ from transformers import (
     AutoTokenizer,
     AutoConfig,
     AutoModelForSequenceClassification,
-    TrainingArguments,
     DataCollatorWithPadding,
     EarlyStoppingCallback,
     set_seed,
@@ -38,6 +37,7 @@ from sklearn.preprocessing import label_binarize
 from mlflow.tracking import MlflowClient
 
 from bertuner.CustomTrainer import CustomTrainer
+from bertuner.compat import TrainingArguments
 from bertuner.exceptions import NonFiniteTrainingError, NoStableTrialError
 from bertuner.TensorBoardCallback import (
     TensorBoardSyncCallback,
@@ -763,20 +763,17 @@ class BERTuneClassifier:
 
         _TA_PARAMS = inspect.signature(TrainingArguments.__init__).parameters
 
-        # inside _build_training_arguments, replacing the warmup_ratio entry:
+        # v5 removed warmup_ratio and accepts fractions in warmup_steps.
         warmup_key = "warmup_ratio" if "warmup_ratio" in _TA_PARAMS else "warmup_steps"
         kwargs[warmup_key] = params["warmup_ratio"]
-        if final:
-            # Canonical final metrics are logged explicitly after restoring the
-            # best checkpoint; Trainer only sends loss curves to TensorBoard.
-            kwargs.update(report_to=["tensorboard"], logging_dir=logging_dir)
-        else:
-            kwargs.update(
-                lr_scheduler_type=params["scheduler"],
-                remove_unused_columns=True,
-                report_to=["none"],
-            )
-        return TrainingArguments(**kwargs)
+        kwargs["lr_scheduler_type"] = params["scheduler"]
+        # Final training uses an explicit TensorBoard writer in _build_trainer;
+        # newer Transformers versions removed TrainingArguments.logging_dir.
+        kwargs.update(remove_unused_columns=True, report_to=["none"])
+        args = TrainingArguments(**kwargs)
+        if warmup_key == "warmup_steps":
+            args._bertuner_warmup_ratio = params["warmup_ratio"]
+        return args
 
     def _build_trainer(
         self,
@@ -798,8 +795,12 @@ class BERTuneClassifier:
             )
         ]
         if final:
+            from transformers.integrations import TensorBoardCallback
+            from torch.utils.tensorboard import SummaryWriter
+
             callbacks.extend(
                 [
+                    TensorBoardCallback(tb_writer=SummaryWriter(logging_dir)),
                     TensorBoardSyncCallback(logging_dir),
                     CleanupCheckpointsCallback,
                 ]
@@ -863,11 +864,15 @@ class BERTuneClassifier:
         try:
             trainer.train()
         except Exception:
+            from transformers.integrations import TensorBoardCallback
+
             # Trainer does not emit on_train_end after an exception. Close only
             # BERTuner-owned writers before the caller decides whether to retry.
             for callback in trainer.callback_handler.callbacks:
                 if isinstance(callback, TensorBoardSyncCallback):
                     callback.writer.close()
+                elif isinstance(callback, TensorBoardCallback) and callback.tb_writer is not None:
+                    callback.tb_writer.close()
             raise
         return trainer, model
 

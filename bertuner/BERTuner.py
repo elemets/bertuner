@@ -56,6 +56,7 @@ from bertuner.constants import (
     MODEL_DROPOUT_ATTRS,
     SEED,
 )
+import inspect
 
 
 class BERTuneClassifier:
@@ -746,7 +747,6 @@ class BERTuneClassifier:
             "gradient_checkpointing": self._use_gradient_checkpointing(max_length),
             "gradient_checkpointing_kwargs": {"use_reentrant": False},
             "weight_decay": params["weight_decay"],
-            "warmup_ratio": params["warmup_ratio"],
             "metric_for_best_model": f"eval_{self.optimize_metric}",
             "greater_is_better": self.greater_is_better,
             "eval_strategy": "epoch",
@@ -760,6 +760,12 @@ class BERTuneClassifier:
             "seed": self.seed,
             **self._precision_flags(precision),
         }
+
+        _TA_PARAMS = inspect.signature(TrainingArguments.__init__).parameters
+
+        # inside _build_training_arguments, replacing the warmup_ratio entry:
+        warmup_key = "warmup_ratio" if "warmup_ratio" in _TA_PARAMS else "warmup_steps"
+        kwargs[warmup_key] = params["warmup_ratio"]
         if final:
             # Canonical final metrics are logged explicitly after restoring the
             # best checkpoint; Trainer only sends loss curves to TensorBoard.

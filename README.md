@@ -80,6 +80,10 @@ print(metrics)
 
 Multi-label classification: pass several target columns — `target_cols=["l1", "l2", "l3"]`. The loss switches to BCE-with-logits and one decision threshold is optimised per label.
 
+Pass `threshold_metric="balanced_accuracy"` to `BERTuneClassifier` to choose thresholds by balanced accuracy. The default, `threshold_metric="f1"`, optimizes F-beta with `threshold_beta=1.0` (F1). Set `threshold_beta=2.0` for F2, which gives recall more weight, or `threshold_beta=0.5` for F0.5, which gives precision more weight. Beta must be positive and finite; it is ignored when using balanced accuracy.
+
+Threshold tuning runs during `train_final_model()` using validation predictions only and is independent of `optimize_metric`, which selects the model during Optuna optimization. It checks every distinct predicted probability, plus 0.5 and a boundary above the maximum for all-negative predictions. Ties prefer 0.5, then the lowest optimal threshold. Multi-label thresholds are chosen independently for each label; multiclass predictions use argmax. The saved `bertuner_config.json` includes `threshold_metric` and `threshold_beta` alongside `optimal_threshold`, and the predictor automatically uses the saved threshold. Reported F1 metrics remain F1 even when the threshold is tuned for another beta.
+
 Grouped data (e.g. multiple notes per patient): pass `group_key="patient_id"` and the train/val/test split guarantees no group leaks across splits.
 
 ### Using existing splits

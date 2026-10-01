@@ -3,6 +3,7 @@ import random
 import json
 import shutil
 import warnings
+from numbers import Real
 import numpy as np
 import pandas as pd
 import torch
@@ -89,11 +90,21 @@ class BERTuneClassifier:
         max_grad_norm: float | None = 1.0,
         class_weight_warning_threshold: float | None = 100.0,
         data_splits: dict[str, pd.DataFrame | str | os.PathLike] = None,
+        threshold_metric: str = "f1",
+        threshold_beta: float = 1.0,
     ):
         if sum(source is not None for source in (data_path, dataframe, data_splits)) != 1:
             raise ValueError("Provide exactly one of data_path (CSV), dataframe, or data_splits.")
         if precision not in {"auto", "fp32", "bf16", "fp16"}:
             raise ValueError("precision must be one of: 'auto', 'fp32', 'bf16', 'fp16'.")
+        if threshold_metric not in ("f1", "balanced_accuracy"):
+            raise ValueError("threshold_metric must be 'f1' or 'balanced_accuracy'.")
+        if (
+            not isinstance(threshold_beta, Real)
+            or not np.isfinite(threshold_beta)
+            or threshold_beta <= 0
+        ):
+            raise ValueError("threshold_beta must be a positive finite number.")
         if max_grad_norm is not None and (
             not np.isfinite(max_grad_norm) or max_grad_norm <= 0
         ):
@@ -156,6 +167,8 @@ class BERTuneClassifier:
         self.best_precision_fallback = False
         # Single-label: scalar float. Multi-label: array of per-label floats.
         self.best_threshold = 0.5
+        self.threshold_metric = threshold_metric
+        self.threshold_beta = float(threshold_beta)
         self.max_length = max_length
         # None → auto: enabled when the effective sequence length is long enough
         # that activation memory dominates (see _use_gradient_checkpointing).
@@ -1219,10 +1232,14 @@ class BERTuneClassifier:
         """
         Finds the best classification threshold(s) on the validation set.
 
-        Binary       → one scalar threshold (maximises F1).
+        Binary       → one scalar threshold.
         Multiclass   → None (predictions are argmax; thresholds don't apply).
-        Multi-label  → one threshold per label (maximises macro-F1);
+        Multi-label  → one independently optimised threshold per label;
                        returns np.ndarray of shape (num_labels,).
+
+        Maximises F-beta (threshold_metric='f1') or balanced accuracy.
+        Evaluates every distinct prediction boundary, including all-negative
+        predictions. Ties prefer 0.5, then the lowest optimal threshold.
         """
         if not self.is_multilabel and not self.is_binary:
             return None
@@ -1231,31 +1248,58 @@ class BERTuneClassifier:
         labels = val_res.label_ids
 
         if self.is_multilabel:
-            # Optimise each label independently
-            best_thresholds = np.full(self.num_labels, 0.5)
-            for i in range(self.num_labels):
-                best_f1, best_t = 0.0, 0.5
-                for thresh in np.linspace(0.1, 0.9, 81):
-                    f1 = f1_score(
-                        labels[:, i],
-                        (probs[:, i] >= thresh).astype(int),
-                        zero_division=0,
-                    )
-                    if f1 > best_f1:
-                        best_f1, best_t = f1, thresh
-                best_thresholds[i] = best_t
-            return best_thresholds
+            return np.array([
+                self._best_binary_threshold(labels[:, i], probs[:, i])
+                for i in range(self.num_labels)
+            ])
+        return self._best_binary_threshold(labels, probs)
+
+    def _best_binary_threshold(self, labels, probs):
+        """Score distinct boundaries in O(n log n), with tied scores kept together."""
+        order = np.argsort(probs)
+        sorted_probs = probs[order]
+        positives = np.concatenate(([0], np.cumsum(labels[order] == 1)))
+        # Use the probability dtype so the all-negative boundary remains above
+        # the maximum when inference compares against float32 probabilities.
+        above_max = float(np.nextafter(probs.max(), np.array(np.inf, dtype=probs.dtype)))
+        thresholds = np.unique(np.append(sorted_probs, [0.5, above_max]))
+        boundaries = np.searchsorted(sorted_probs, thresholds, side="left")
+        tp = positives[-1] - positives[boundaries]
+        fn = positives[boundaries]
+        fp = len(labels) - boundaries - tp
+        tn = boundaries - fn
+
+        if self.threshold_metric == "balanced_accuracy":
+            scores = np.zeros(len(thresholds))
+            present_classes = 0
+            if positives[-1] > 0:
+                scores += tp / positives[-1]
+                present_classes += 1
+            negatives = len(labels) - positives[-1]
+            if negatives > 0:
+                scores += tn / negatives
+                present_classes += 1
+            scores /= present_classes
         else:
-            best_f1, best_t = 0.0, 0.5
-            for thresh in np.linspace(0.1, 0.9, 81):
-                f1 = f1_score(
-                    labels,
-                    (probs >= thresh).astype(int),
-                    zero_division=0,
-                )
-                if f1 > best_f1:
-                    best_f1, best_t = f1, thresh
-            return best_t
+            # Normalised beta weights avoid overflow for large finite beta.
+            beta = self.threshold_beta
+            if beta <= 1:
+                recall_weight = beta * beta / (1 + beta * beta)
+                precision_weight = 1 / (1 + beta * beta)
+            else:
+                inverse_square = (1 / beta) ** 2
+                recall_weight = 1 / (1 + inverse_square)
+                precision_weight = inverse_square / (1 + inverse_square)
+            denominator = tp + recall_weight * fn + precision_weight * fp
+            scores = np.divide(
+                tp, denominator, out=np.zeros(len(thresholds)), where=denominator > 0
+            )
+
+        best_score = scores.max()
+        default_index = np.searchsorted(thresholds, 0.5)
+        if scores[default_index] == best_score:
+            return 0.5
+        return float(thresholds[np.argmax(scores)])
 
     # ------------------------------------------------------------------
     # Metrics DataFrame
@@ -1404,6 +1448,8 @@ class BERTuneClassifier:
                 "model": self.best_params["model"],
                 "model_path": model_path,
                 "optimal_threshold": threshold,
+                "threshold_metric": self.threshold_metric,
+                "threshold_beta": self.threshold_beta,
                 "is_multilabel": self.is_multilabel,
                 "target_cols": self.target_cols,
                 "max_length": max_length if max_length is not None else self.max_length,

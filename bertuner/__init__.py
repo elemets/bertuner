@@ -1,6 +1,6 @@
 """bertuner: hyperparameter optimization and fine-tuning for BERT-style text classifiers."""
 
-__version__ = "0.2.3"
+__version__ = "0.2.4"
 
 from bertuner.BERTuner import BERTuneClassifier
 from bertuner.Predictor import BERTunePredictor

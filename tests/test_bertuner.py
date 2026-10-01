@@ -9,6 +9,7 @@ import pandas as pd
 import pytest
 import optuna
 import mlflow
+from sklearn.metrics import balanced_accuracy_score, fbeta_score
 from mlflow.tracking import MlflowClient
 
 from bertuner.BERTuner import BERTuneClassifier
@@ -244,6 +245,75 @@ class TestGetProbs:
 
 
 class TestOptimizeThreshold:
+    @pytest.mark.parametrize("metric", ["auc_roc", "fbeta", None])
+    def test_invalid_metric(self, tmp_path, metric):
+        with pytest.raises(ValueError, match="threshold_metric"):
+            make_classifier(tmp_path, threshold_metric=metric)
+
+    @pytest.mark.parametrize("beta", [0, -1, np.nan, np.inf, "2", None])
+    def test_invalid_beta(self, tmp_path, beta):
+        with pytest.raises(ValueError, match="threshold_beta"):
+            make_classifier(tmp_path, threshold_beta=beta)
+
+    @pytest.mark.parametrize("metric", ["f1", "balanced_accuracy"])
+    def test_clustered_probabilities(self, tmp_path, monkeypatch, metric):
+        clf = make_classifier(tmp_path, threshold_metric=metric)
+        probs = np.array([0.531, 0.534, 0.536, 0.539])
+        monkeypatch.setattr(clf, "_get_probs", lambda _: probs)
+        threshold = clf._optimize_threshold(SimpleNamespace(
+            predictions=None, label_ids=np.array([0, 0, 1, 1])
+        ))
+        assert threshold == 0.536
+
+    @pytest.mark.parametrize("metric, beta, expected", [
+        ("f1", 0.5, 0.9), ("f1", 1, 0.5), ("f1", 2, 0.5),
+        ("balanced_accuracy", 1, 0.9),
+    ])
+    def test_metric_changes_optimal_threshold(self, tmp_path, monkeypatch, metric, beta, expected):
+        clf = make_classifier(tmp_path, threshold_metric=metric, threshold_beta=beta)
+        probs = np.array([0.9, 0.8, 0.7, 0.6, 0.55, 0.54])
+        monkeypatch.setattr(clf, "_get_probs", lambda _: probs)
+        threshold = clf._optimize_threshold(SimpleNamespace(
+            predictions=None, label_ids=np.array([1, 0, 0, 1, 0, 1])
+        ))
+        assert threshold == expected
+
+    @pytest.mark.parametrize("metric, beta", [
+        ("f1", 1), ("f1", 2), ("f1", 0.5), ("balanced_accuracy", 1)
+    ])
+    def test_matches_exhaustive_search(self, tmp_path, metric, beta):
+        clf = make_classifier(tmp_path, threshold_metric=metric, threshold_beta=beta)
+        rng = np.random.default_rng(17)
+        for _ in range(10):
+            probs = rng.choice([0.02, 0.531, 0.534, 0.539, 0.98], 30)
+            labels = rng.integers(0, 2, len(probs))
+            candidates = np.unique(np.append(probs, [0.5, 1.0]))
+            def score(t):
+                preds = probs >= t
+                if metric == "balanced_accuracy":
+                    return balanced_accuracy_score(labels, preds)
+                return fbeta_score(labels, preds, beta=beta, zero_division=0)
+            threshold = clf._best_binary_threshold(labels, probs)
+            assert score(threshold) == pytest.approx(max(map(score, candidates)))
+
+    @pytest.mark.parametrize("metric", ["f1", "balanced_accuracy"])
+    def test_multilabel_single_class_and_saturated_scores(self, tmp_path, monkeypatch, metric):
+        cols = ["l1", "l2"]
+        clf = make_classifier(
+            tmp_path, target_cols=cols, dataframe=make_df(multilabel_cols=cols),
+            threshold_metric=metric,
+        )
+        probs = np.array([[1, 0], [1, 0]], dtype=np.float32)
+        labels = np.array([[0, 1], [0, 1]])
+        monkeypatch.setattr(clf, "_get_probs", lambda _: probs)
+        thresholds = clf._optimize_threshold(SimpleNamespace(predictions=None, label_ids=labels))
+        assert thresholds[1] == 0
+        if metric == "balanced_accuracy":
+            assert thresholds[0] > 1
+            assert not np.any(probs[:, 0] >= thresholds[0])
+        else:
+            assert thresholds[0] == 0.5  # All F-beta scores are zero.
+
     def test_single_label_finds_separating_threshold(self, tmp_path):
         clf = make_classifier(tmp_path)
         # Positives cluster at high prob, negatives at low → best threshold between
@@ -529,10 +599,21 @@ class TestSaveModel:
         meta = config["model_metadata"]
         assert meta["model_path"] == "bert-base-uncased"
         assert meta["optimal_threshold"] == 0.42
+        assert meta["threshold_metric"] == "f1"
+        assert meta["threshold_beta"] == 1.0
         assert meta["is_multilabel"] is False
         assert meta["target_cols"] == ["target"]
         assert meta["max_length"] == 512
         assert config["parameters"] == clf.best_params
+
+    @pytest.mark.parametrize("metric, beta", [("balanced_accuracy", 1), ("f1", 2)])
+    def test_saves_threshold_settings(self, tmp_path, metric, beta):
+        clf = make_classifier(tmp_path, threshold_metric=metric, threshold_beta=beta)
+        clf.best_params = {"model": "bert-base"}
+        clf._save_model(str(tmp_path), MagicMock(), MagicMock(), "bert-base-uncased")
+        config = json.loads((tmp_path / "model" / "bertuner_config.json").read_text())
+        assert config["model_metadata"]["threshold_metric"] == metric
+        assert config["model_metadata"]["threshold_beta"] == beta
 
     def test_multilabel_threshold_serialised_as_list(self, tmp_path):
         cols = ["l1", "l2"]
